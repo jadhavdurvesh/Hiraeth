@@ -1,87 +1,111 @@
-# Hiraeth — Fine-tuning Pipeline
+# Hiraeth
 
-Fine-tunes a base LLM into **Hiraeth** using data built with
-[DMJ-Dataset-Builder](https://github.com/jadhavdurvesh/DMJ-Dataset-Builder),
-trained with QLoRA on Kaggle's 2x GPU (T4 or P100) notebooks.
+Fine-tuning pipeline for **Hiraeth**, a chat + code instruction-tuned LLM
+built on `Qwen/Qwen2.5-7B-Instruct` via QLoRA, trained on Kaggle's free 2×
+GPU (T4/P100) notebooks.
 
-## Why this setup
+Training data comes from
+[Hiraeth-Forge](https://github.com/jadhavdurvesh/Hiraeth-Forge), a separate
+pipeline that downloads, cleans, and merges instruction-tuning datasets into
+**Hiraeth Atlas** (the actual training set).
 
-- **Base model:** `Qwen/Qwen2.5-7B-Instruct` (Apache-2.0) — strong on both
-  general chat and code, and small enough to QLoRA-tune on 2x 16GB GPUs.
-  Swap to a 3B model in the args if you want faster iteration first.
-- **Method:** QLoRA (4-bit NF4 base + LoRA adapters) — full fine-tuning of a
-  7B model isn't realistic on Kaggle's GPUs or with a 10k-100k example
-  dataset (you'd overfit and burn the session time-limit anyway).
-- **GPU strategy:** `device_map="auto"` shards the base model across both
-  GPUs within a single notebook process. This avoids the multi-process
-  (`torchrun`/`accelerate launch`) setup that's awkward inside a Kaggle
-  notebook cell, and is the standard approach for 2-GPU QLoRA on Kaggle.
-- **Future domain-specialization:** metadata (`category`, `topic`,
-  `difficulty`, `source`) from your DMJ records is preserved in
-  `data/train_meta.jsonl` and `prepare_dataset.py` has a `--category_filter`
-  flag, so you can later carve out a domain-specific subset or do
-  category-weighted training without changing the core pipeline.
-
-## Folder structure
+## What's here
 
 ```
-hiraeth/
+Hiraeth/
 ├── scripts/
-│   ├── prepare_dataset.py   # DMJ JSONL -> chat-formatted train/val JSONL
-│   ├── train.py             # QLoRA SFT training
+│   ├── prepare_dataset.py   # Hiraeth Atlas JSONL -> chat-formatted train/val
+│   ├── train.py             # QLoRA SFT training (2-GPU sharded via device_map="auto")
 │   ├── merge_and_save.py    # merge LoRA adapter into a standalone model
-│   ├── chat.py              # quick manual test/chat with the result
+│   ├── chat.py              # manual chat/test loop, reports token usage per turn
 │   └── requirements.txt
 ├── notebook/
-│   └── hiraeth_train.ipynb  # ready-to-run Kaggle notebook (2 GPU)
-└── data/                    # (empty — filled by prepare_dataset.py)
+│   └── hiraeth_train.ipynb  # Kaggle notebook: clone repo -> prep -> train -> merge -> zip
+└── docs/
+    └── PLANNING.md          # archived original design doc
 ```
 
-## Steps
+## Status — what's actually verified
 
-1. **Build your dataset** with DMJ-Dataset-Builder (`build.py download`,
-   `convert`, `validate`, `merge`) to produce a final merged `.jsonl`
-   matching the schema in its README.
+Being upfront about this since it matters for anyone picking this up:
 
-2. **Prepare it for chat fine-tuning:**
-   ```
-   python scripts/prepare_dataset.py \
-       --input path/to/final_merged.jsonl \
-       --output_dir data \
-       --val_split 0.02
-   ```
+| Piece | Status |
+|---|---|
+| `prepare_dataset.py` | Logic verified locally against the Hiraeth Atlas schema. Converts DMJ/Atlas records into chat-formatted JSONL correctly. |
+| `train.py` | Written and syntax-checked. **Not yet run end-to-end** — needs a GPU environment (Kaggle) that this dev environment doesn't have. |
+| `merge_and_save.py` | Written and syntax-checked, same caveat — needs an actual trained adapter to merge. |
+| `chat.py` | Written and syntax-checked, includes per-turn and session token-usage reporting. Not yet run against a real trained model. |
+| `notebook/hiraeth_train.ipynb` | Wired up to clone this repo, pull a Kaggle-Dataset-attached Hiraeth Atlas file, and run the full pipeline. Not yet executed on Kaggle. |
 
-3. **Upload to Kaggle** — either upload `data/train.jsonl` + `data/val.jsonl`
-   as a Kaggle Dataset, or upload the DMJ repo output and run
-   `prepare_dataset.py` inside the notebook (the provided notebook does the
-   latter). Also upload the `scripts/` folder as notebook input, or paste
-   the scripts into cells.
+In short: the code is complete and internally consistent, but **the first
+real training run hasn't happened yet.** The next real milestone is running
+`build.py all` in Hiraeth-Forge to produce a real Hiraeth Atlas dataset,
+then running this repo's notebook on Kaggle against it.
 
-4. **Enable 2x GPU + Internet** in the Kaggle notebook settings, then run
-   `notebook/hiraeth_train.ipynb` top to bottom.
+## How the pieces fit together
 
-5. Result: a merged standalone Hiraeth model in
-   `/kaggle/working/hiraeth-merged`, ready to zip/download or push to the
-   Hugging Face Hub (`merge_and_save.py --push_to_hub_id you/hiraeth-7b`).
+```
+Hiraeth-Forge (separate repo)
+        │
+        ▼
+  Hiraeth Atlas (final_merged.jsonl)
+        │
+        ▼
+  prepare_dataset.py  →  train.jsonl / val.jsonl (chat-formatted)
+        │
+        ▼
+  train.py  →  QLoRA adapter (4-bit base + LoRA weights)
+        │
+        ▼
+  merge_and_save.py  →  standalone merged Hiraeth model
+        │
+        ▼
+  chat.py  →  manual testing, with token usage reported per turn
+```
 
-## Tuning knobs for your dataset size (10k-100k examples)
+## Quick start (on Kaggle)
 
-- `--num_train_epochs 3` is a reasonable starting point; watch `eval_loss`
-  in the notebook logs and stop earlier if it starts climbing (overfitting).
-- `--per_device_train_batch_size 2` + `--gradient_accumulation_steps 8`
-  gives an effective batch size of 16 across the 2 GPUs — adjust down if
-  you hit OOM, up if you have headroom.
-- If your dataset skews heavily toward one category (e.g. mostly code),
-  either accept that (fine for a general+code assistant) or use
-  `--category_filter` to balance a training subset.
+1. Build a Hiraeth Atlas dataset with
+   [Hiraeth-Forge](https://github.com/jadhavdurvesh/Hiraeth-Forge)
+   (`python build.py all`), upload the resulting JSONL as a Kaggle Dataset.
+2. New Kaggle notebook → Settings → **GPU T4 x2**, **Internet: On** → attach
+   your dataset via Add Input.
+3. Open `notebook/hiraeth_train.ipynb`, set `GITHUB_USERNAME`,
+   `DATASET_NAME`, and `RAW_FILENAME` at the top of the relevant cells to
+   match your setup.
+4. Run top to bottom. Last cell zips the merged model for download (also has
+   a commented-out Hugging Face Hub push as an alternative).
 
-## Notes / things you'll want to decide as you go
+## Token usage in chat.py
 
-- Kaggle notebook sessions have a **~9 hour** and (usually) **30 hrs/week**
-  GPU quota — a 7B QLoRA run over ~30-80k examples at 3 epochs will likely
-  need to be split across sessions using `--resume_from_checkpoint` (pass
-  the last checkpoint dir to `SFTConfig`/`train.py` — you'll want to add
-  a `--resume_from_checkpoint` arg if a single run doesn't finish; happy to
-  add that if you hit this).
-- Nothing here does RLHF/DPO — this is supervised fine-tuning (SFT) only,
-  which matches an instruction-tuning dataset like DMJ's output.
+`chat.py` reports prompt tokens, completion tokens, and running session
+totals after every turn — the same way hosted chat APIs report usage. Two
+things worth knowing:
+
+- **Prompt tokens grow every turn** because the full running conversation
+  (system prompt + all prior turns) is re-tokenized and re-sent to the model
+  each time — this isn't a bug, it's how the chat template works and matches
+  how hosted APIs bill multi-turn conversations.
+- This is a **real tokenizer count**, different from the `estimated_tokens`
+  field in Hiraeth Atlas metadata, which is a rough word-count estimate used
+  during dataset prep — not the same number.
+
+## Design notes
+
+- **Base model:** Qwen2.5-7B-Instruct — Apache-2.0, strong on general chat
+  and code, small enough to QLoRA-tune on 2× 16GB GPUs.
+- **Method:** QLoRA (4-bit NF4 + LoRA adapters), not full fine-tuning — not
+  realistic on Kaggle's GPUs or a 10k-100k example dataset.
+- **GPU strategy:** `device_map="auto"` shards the base model across both
+  GPUs within a single notebook process, avoiding `torchrun`/multi-process
+  setup that's awkward inside a Kaggle notebook cell.
+- This is supervised fine-tuning (SFT) only — no RLHF/DPO here.
+
+## Known gaps / things to add if you hit them
+
+- No `--resume_from_checkpoint` support in `train.py` yet — if a training
+  run doesn't finish in one Kaggle session (sessions cap around 9-12 hours,
+  ~30 GPU-hrs/week), you'll want to add this.
+- Topic/category balance in training data depends entirely on what
+  Hiraeth-Forge produces — check `python build.py stats` there before
+  training if you care about balance across categories.
