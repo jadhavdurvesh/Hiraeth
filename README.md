@@ -18,7 +18,11 @@ Hiraeth/
 │   ├── train.py             # QLoRA SFT training (2-GPU sharded via device_map="auto")
 │   ├── merge_and_save.py    # merge LoRA adapter into a standalone model
 │   ├── chat.py              # manual chat/test loop, reports token usage per turn
+│   ├── run_eval.py          # runs a checkpoint against eval/eval_prompts.json, writes a report
 │   └── requirements.txt
+├── eval/
+│   ├── eval_prompts.json    # 12 hand-written prompts spanning target skills
+│   └── reports/             # generated eval reports land here (gitignored)
 ├── notebook/
 │   └── hiraeth_train.ipynb  # Kaggle notebook: clone repo -> prep -> train -> merge -> zip
 └── docs/
@@ -76,7 +80,25 @@ Hiraeth-Forge (separate repo)
 4. Run top to bottom. Last cell zips the merged model for download (also has
    a commented-out Hugging Face Hub push as an alternative).
 
-## Token usage in chat.py
+## Pre-training improvements (added before the first real run)
+
+- **NEFTune** (`--neftune_alpha`, default 5): adds noise to input embeddings during
+  training — known to improve instruction-following quality at no extra compute
+  cost. Set to 0 to disable.
+- **Sequence packing** (`--packing`, default on): concatenates short examples into
+  full-length blocks instead of padding each one individually, improving GPU
+  utilization and training speed for the same GPU-hours. Pass `--packing false`
+  to disable if you need each example in its own attention window.
+- **LoRA presets** (`--lora_preset standard|large`): `standard` (r=16/alpha=32) is
+  the default; `large` (r=32/alpha=64) gives more adapter capacity — worth trying
+  if `standard` underfits on a larger dataset. Pass `--lora_r`/`--lora_alpha`
+  directly to override the preset entirely.
+- **Manual eval prompt set** (`eval/eval_prompts.json` + `scripts/run_eval.py`):
+  `eval_loss` alone doesn't tell you if answers are actually good. `run_eval.py`
+  runs a checkpoint against 12 prompts spanning code, reasoning, general
+  knowledge, instruction-following, multi-step tasks, and safety, and writes a
+  timestamped Markdown report — diff reports across checkpoints to see how
+  answers change over training.
 
 `chat.py` reports prompt tokens, completion tokens, and running session
 totals after every turn — the same way hosted chat APIs report usage. Two
@@ -109,3 +131,7 @@ things worth knowing:
 - Topic/category balance in training data depends entirely on what
   Hiraeth-Forge produces — check `python build.py stats` there before
   training if you care about balance across categories.
+
+## License
+
+DMJ Community License (DCL) v1.0 — see [LICENSE.md](LICENSE.md). Free to use, study, fork, and redistribute with attribution; the Hiraeth Atlas dataset and trained Hiraeth model weights have additional restrictions on commercial resale (see Section 5).

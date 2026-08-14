@@ -13,6 +13,14 @@ Base model default: Qwen/Qwen2.5-7B-Instruct
 Swap --base_model to a smaller model (e.g. Qwen/Qwen2.5-3B-Instruct or
 meta-llama/Llama-3.2-3B-Instruct) if you want faster iteration first.
 
+Enabled by default (see argparse help below for details):
+  - Packing: concatenates short examples into full-length blocks -> better
+    GPU utilization, faster training for the same GPU-hours.
+  - NEFTune (alpha=5): noise on input embeddings during training, known to
+    improve instruction-following quality at no extra compute cost.
+  - LoRA preset "standard" (r=16, alpha=32) — pass --lora_preset large for
+    r=32/alpha=64 if you want more adapter capacity on a bigger dataset.
+
 Usage (inside a Kaggle notebook cell, GPU T4 x2 or P100 x2 enabled):
 
   !python train.py \
@@ -25,6 +33,12 @@ Usage (inside a Kaggle notebook cell, GPU T4 x2 or P100 x2 enabled):
       --gradient_accumulation_steps 8 \
       --learning_rate 2e-4 \
       --max_seq_length 2048
+
+  # Try the larger LoRA preset instead:
+  !python train.py ... --lora_preset large
+
+  # Disable NEFTune or packing if you want the plain baseline behavior:
+  !python train.py ... --neftune_alpha 0 --packing false
 """
 
 import argparse
@@ -53,9 +67,35 @@ def parse_args():
     ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
     ap.add_argument("--learning_rate", type=float, default=2e-4)
     ap.add_argument("--max_seq_length", type=int, default=2048)
-    ap.add_argument("--lora_r", type=int, default=16)
-    ap.add_argument("--lora_alpha", type=int, default=32)
+
+    # LoRA rank/alpha: choose a preset, or override r/alpha manually.
+    # "standard" (r=16, alpha=32) — lighter, faster, less VRAM. Good default.
+    # "large" (r=32, alpha=64) — more adapter capacity, more VRAM/time.
+    #   Worth trying if standard underfits on a larger (50k+) dataset.
+    ap.add_argument(
+        "--lora_preset", choices=["standard", "large"], default="standard",
+        help="standard = r16/alpha32 (default). large = r32/alpha64 (more capacity, more VRAM/time).",
+    )
+    ap.add_argument("--lora_r", type=int, default=None, help="Overrides --lora_preset if set")
+    ap.add_argument("--lora_alpha", type=int, default=None, help="Overrides --lora_preset if set")
     ap.add_argument("--lora_dropout", type=float, default=0.05)
+
+    # NEFTune: adds noise to input embeddings during training, which has been shown
+    # to improve instruction-following quality at ~no extra compute cost.
+    # Set to 0 to disable. 5 is the commonly-used default from the NEFTune paper.
+    ap.add_argument(
+        "--neftune_alpha", type=float, default=5.0,
+        help="NEFTune noise alpha. 0 disables NEFTune entirely.",
+    )
+
+    # Packing: concatenates multiple short examples into one max_seq_length block
+    # instead of padding each example individually. Meaningfully improves GPU
+    # utilization/training speed on datasets with lots of short examples — matters
+    # on Kaggle's limited weekly GPU-hour quota. Default on; disable if you need
+    # each example to stay in its own attention window (e.g. very long single examples).
+    ap.add_argument("--packing", type=lambda x: x.lower() != "false", default=True,
+                     help="Pass --packing false to disable")
+
     ap.add_argument("--logging_steps", type=int, default=10)
     ap.add_argument("--save_steps", type=int, default=200)
     ap.add_argument("--eval_steps", type=int, default=200)
@@ -64,8 +104,18 @@ def parse_args():
     return ap.parse_args()
 
 
+LORA_PRESETS = {"standard": (16, 32), "large": (32, 64)}
+
+
 def main():
     args = parse_args()
+
+    # Resolve LoRA r/alpha: explicit --lora_r/--lora_alpha wins, else use the preset
+    preset_r, preset_alpha = LORA_PRESETS[args.lora_preset]
+    lora_r = args.lora_r if args.lora_r is not None else preset_r
+    lora_alpha = args.lora_alpha if args.lora_alpha is not None else preset_alpha
+    print(f"LoRA config: r={lora_r}, alpha={lora_alpha} "
+          f"({'explicit override' if args.lora_r is not None else f'preset: {args.lora_preset}'})")
 
     n_gpus = torch.cuda.device_count()
     print(f"Detected {n_gpus} GPU(s)")
@@ -98,8 +148,8 @@ def main():
     model = prepare_model_for_kbit_training(model)
 
     lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
+        r=lora_r,
+        lora_alpha=lora_alpha,
         lora_dropout=args.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
@@ -148,7 +198,8 @@ def main():
         report_to="none",
         seed=args.seed,
         dataset_text_field="text",
-        packing=False,
+        packing=args.packing,
+        neftune_noise_alpha=args.neftune_alpha if args.neftune_alpha > 0 else None,
     )
 
     trainer = SFTTrainer(
