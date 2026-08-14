@@ -44,6 +44,10 @@ def main():
     model.eval()
     messages = [{"role": "system", "content": args.system_prompt}]
 
+    # Running totals for the whole session
+    session_prompt_tokens = 0
+    session_completion_tokens = 0
+
     print("Hiraeth is ready. Type 'exit' to quit.\n")
     while True:
         user_msg = input("You: ").strip()
@@ -56,6 +60,11 @@ def main():
         )
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
+        # Prompt token count = length of the tokenized input (this
+        # already includes system prompt + full conversation history,
+        # since we re-tokenize the whole running "messages" list each turn)
+        prompt_tokens = inputs["input_ids"].shape[1]
+
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
@@ -66,10 +75,26 @@ def main():
                 pad_token_id=tokenizer.eos_token_id,
             )
 
-        reply = tokenizer.decode(
-            output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
-        )
+        # Completion token count = everything generated beyond the prompt
+        completion_ids = output_ids[0][prompt_tokens:]
+        completion_tokens = completion_ids.shape[0]
+
+        reply = tokenizer.decode(completion_ids, skip_special_tokens=True)
+
+        # Note: prompt_tokens grows every turn because the full running
+        # conversation is re-tokenized each time (same as how hosted chat
+        # APIs bill it) — this is NOT double counting, it reflects that
+        # every turn re-sends the whole context to the model.
+        session_prompt_tokens += prompt_tokens
+        session_completion_tokens += completion_tokens
+        total_tokens = prompt_tokens + completion_tokens
+
         print(f"Hiraeth: {reply}\n")
+        print(
+            f"  [tokens] prompt: {prompt_tokens} | completion: {completion_tokens} "
+            f"| turn total: {total_tokens} | session total: "
+            f"{session_prompt_tokens + session_completion_tokens}\n"
+        )
         messages.append({"role": "assistant", "content": reply})
 
 
