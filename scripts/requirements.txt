@@ -1,9 +1,22 @@
-transformers>=4.46.0
-datasets>=2.20.0
-peft>=0.13.0
-trl>=0.11.0
-bitsandbytes>=0.44.0
-accelerate>=1.0.0
-sentencepiece
-protobuf
-huggingface_hub
+# Pinned to versions verified compatible with train.py's use of:
+#   SFTConfig(max_seq_length=..., packing=..., neftune_noise_alpha=...,
+#             include_num_input_tokens_seen=...)
+# Newer versions will likely work too, but if you hit an unexpected
+# TypeError about an unknown argument, pin back to these first.
+#
+# IMPORTANT (Kaggle-specific): do NOT let this install upgrade torch.
+# Kaggle notebooks ship with a PyTorch build matched to their CUDA driver;
+# an incidental torch upgrade from pip resolving dependencies is a common,
+# confusing cause of GPUs silently not being used (or CUDA errors) on Kaggle.
+# If you're not sure, run `pip install --no-deps -r requirements.txt` instead,
+# then separately confirm `torch.cuda.is_available()` is still True.
+
+transformers==4.46.3
+datasets==3.1.0
+peft==0.13.2
+trl==0.12.0
+bitsandbytes==0.44.1
+accelerate==1.1.1
+sentencepiece==0.2.0
+protobuf==5.28.3
+huggingface_hub==0.26.2

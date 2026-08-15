@@ -21,8 +21,27 @@ Enabled by default (see argparse help below for details):
   - LoRA preset "standard" (r=16, alpha=32) — pass --lora_preset large for
     r=32/alpha=64 if you want more adapter capacity on a bigger dataset.
 
+Fixes for known Kaggle 2-GPU issues (see docs/TRAINING_GUIDE.md for details):
+  - Crash on 2 GPUs: Trainer was trying to also wrap the already-sharded
+    (device_map="auto") model for multi-GPU DataParallel, conflicting with
+    it. Fixed by marking the model as already parallelized.
+  - Extremely slow / stuck training on 1 GPU: was hardcoded to bf16, which
+    T4 and P100 (Kaggle's free GPUs) don't have real hardware support for.
+    Now auto-detects and uses fp16 on GPUs without bf16 support.
+  - Apparent freeze after step 1: Kaggle notebooks are known to hang with
+    multi-worker DataLoaders. Now forces dataloader_num_workers=0.
+  - Use --max_steps 20 for a quick smoke test before committing to a full run.
+
 Usage (inside a Kaggle notebook cell, GPU T4 x2 or P100 x2 enabled):
 
+  # Quick smoke test first — confirms the pipeline works, ~5-10 min:
+  !python train.py \
+      --train_file ../data/train.jsonl \
+      --val_file ../data/val.jsonl \
+      --output_dir /kaggle/working/hiraeth-smoketest \
+      --max_steps 20
+
+  # Full run:
   !python train.py \
       --base_model Qwen/Qwen2.5-7B-Instruct \
       --train_file ../data/train.jsonl \
@@ -96,11 +115,17 @@ def parse_args():
     ap.add_argument("--packing", type=lambda x: x.lower() != "false", default=True,
                      help="Pass --packing false to disable")
 
-    ap.add_argument("--logging_steps", type=int, default=10)
+    ap.add_argument("--logging_steps", type=int, default=5)
     ap.add_argument("--save_steps", type=int, default=200)
     ap.add_argument("--eval_steps", type=int, default=200)
     ap.add_argument("--warmup_ratio", type=float, default=0.03)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--max_steps", type=int, default=-1,
+        help="Cap total training steps. Use a small number (e.g. 20) for a quick "
+             "smoke test to confirm the pipeline works before committing to a full run. "
+             "-1 (default) means no cap — train for the full num_train_epochs.",
+    )
     return ap.parse_args()
 
 
@@ -122,10 +147,20 @@ def main():
     for i in range(n_gpus):
         print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
 
+    # T4 and P100 (Kaggle's free GPUs) do NOT have real hardware bf16 support —
+    # that requires Ampere or newer (compute capability 8.0+). Using bf16 on
+    # these GPUs silently falls back to slow, unaccelerated math, which is very
+    # likely the cause of multi-minute-per-step training. Detect and use fp16
+    # instead on older GPUs.
+    use_bf16 = n_gpus > 0 and torch.cuda.is_bf16_supported()
+    compute_dtype = torch.bfloat16 if use_bf16 else torch.float16
+    print(f"Using {'bf16' if use_bf16 else 'fp16'} "
+          f"({'GPU supports bf16' if use_bf16 else 'GPU does not support bf16 (T4/P100) — using fp16 instead'})")
+
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=compute_dtype,
         bnb_4bit_use_double_quant=True,
     )
 
@@ -144,6 +179,18 @@ def main():
         trust_remote_code=True,
     )
     model.config.use_cache = False
+
+    # IMPORTANT multi-GPU fix: when a model is loaded with device_map="auto"
+    # across multiple GPUs, HF Trainer doesn't automatically know the model
+    # already handles its own multi-GPU placement (naive pipeline parallelism).
+    # Without these two flags, Trainer tries to ALSO wrap the model for
+    # multi-GPU (DataParallel), which conflicts with the existing device split
+    # and crashes. This is almost certainly what caused the crash on 2 GPUs.
+    if n_gpus > 1:
+        model.is_parallelizable = True
+        model.model_parallel = True
+        print("Multi-GPU: marked model as already parallelized (prevents Trainer "
+              "from wrapping it in DataParallel, which is what likely crashed before)")
 
     model = prepare_model_for_kbit_training(model)
 
@@ -178,6 +225,7 @@ def main():
     sft_config = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -191,7 +239,8 @@ def main():
         save_total_limit=2,
         warmup_ratio=args.warmup_ratio,
         lr_scheduler_type="cosine",
-        bf16=True,
+        bf16=use_bf16,
+        fp16=not use_bf16,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="paged_adamw_8bit",
@@ -200,6 +249,16 @@ def main():
         dataset_text_field="text",
         packing=args.packing,
         neftune_noise_alpha=args.neftune_alpha if args.neftune_alpha > 0 else None,
+        # Kaggle notebooks are known to hang with multi-worker DataLoaders due to
+        # /dev/shm restrictions in the container — this was very likely the cause
+        # of training appearing to "freeze" after the first step. 0 = load data in
+        # the main process, no subprocess hangs.
+        dataloader_num_workers=0,
+        # Print a running average of tokens/sec and step timing so it's clear
+        # whether training is actually progressing, not just guessing from silence
+        # between logging_steps.
+        logging_first_step=True,
+        include_num_input_tokens_seen=True,
     )
 
     trainer = SFTTrainer(

@@ -24,8 +24,9 @@ Hiraeth/
 │   ├── eval_prompts.json    # 12 hand-written prompts spanning target skills
 │   └── reports/             # generated eval reports land here (gitignored)
 ├── notebook/
-│   └── hiraeth_train.ipynb  # Kaggle notebook: clone repo -> prep -> train -> merge -> zip
+│   └── hiraeth_train.ipynb  # Kaggle notebook: clone -> prep -> smoke test -> train -> merge -> eval -> zip
 └── docs/
+    ├── TRAINING_GUIDE.md    # step-by-step Kaggle guide with troubleshooting
     └── PLANNING.md          # archived original design doc
 ```
 
@@ -36,7 +37,7 @@ Being upfront about this since it matters for anyone picking this up:
 | Piece | Status |
 |---|---|
 | `prepare_dataset.py` | Logic verified locally against the Hiraeth Atlas schema. Converts DMJ/Atlas records into chat-formatted JSONL correctly. |
-| `train.py` | Written and syntax-checked. **Not yet run end-to-end** — needs a GPU environment (Kaggle) that this dev environment doesn't have. |
+| `train.py` | Fixed two real bugs reported from an actual Kaggle run: a multi-GPU crash (Trainer conflicting with `device_map="auto"` sharding) and extreme slowness from hardcoded bf16 on T4/P100 (which don't support it in hardware). Also added a `--max_steps` smoke-test mode and fixed a likely DataLoader-hang cause. Still needs a full run on Kaggle to confirm the fixes hold end-to-end. |
 | `merge_and_save.py` | Written and syntax-checked, same caveat — needs an actual trained adapter to merge. |
 | `chat.py` | Written and syntax-checked, includes per-turn and session token-usage reporting. Not yet run against a real trained model. |
 | `notebook/hiraeth_train.ipynb` | Wired up to clone this repo, pull a Kaggle-Dataset-attached Hiraeth Atlas file, and run the full pipeline. Not yet executed on Kaggle. |
@@ -69,16 +70,22 @@ Hiraeth-Forge (separate repo)
 
 ## Quick start (on Kaggle)
 
+**For the full walkthrough with troubleshooting, read
+[`docs/TRAINING_GUIDE.md`](docs/TRAINING_GUIDE.md) — it covers real issues
+people have hit (multi-GPU crashes, bf16-on-T4 slowdowns, apparent
+freezes) and exactly what to check at each step.**
+
+Short version:
+
 1. Build a Hiraeth Atlas dataset with
    [Hiraeth-Forge](https://github.com/jadhavdurvesh/Hiraeth-Forge)
    (`python build.py all`), upload the resulting JSONL as a Kaggle Dataset.
 2. New Kaggle notebook → Settings → **GPU T4 x2**, **Internet: On** → attach
    your dataset via Add Input.
-3. Open `notebook/hiraeth_train.ipynb`, set `GITHUB_USERNAME`,
-   `DATASET_NAME`, and `RAW_FILENAME` at the top of the relevant cells to
-   match your setup.
-4. Run top to bottom. Last cell zips the merged model for download (also has
-   a commented-out Hugging Face Hub push as an alternative).
+3. Open `notebook/hiraeth_train.ipynb`, set `DATASET_NAME` and
+   `RAW_FILENAME` at the top of the relevant cells to match your setup.
+4. Run top to bottom — includes a 20-step smoke test before the full
+   training run, and an eval spot-check after merging.
 
 ## Pre-training improvements (added before the first real run)
 
