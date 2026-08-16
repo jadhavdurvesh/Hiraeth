@@ -185,8 +185,26 @@ installing one package at its latest version while others stay pinned.
 
 **`PackageNotFoundError: No package metadata was found for bitsandbytes`:**
 bitsandbytes didn't install correctly. Re-run
-`pip install --no-deps bitsandbytes==0.44.1` on its own and check for errors
+`pip install -U --no-deps bitsandbytes` on its own and check for errors
 before continuing.
+
+**`ModuleNotFoundError: No module named 'triton.ops'` (during model
+loading, traceback goes through `bitsandbytes` → `triton_based_modules`),
+or `Could not find the bitsandbytes CUDA binary`:**
+This means the installed bitsandbytes version is too old for Kaggle's
+current CUDA version — it doesn't have a prebuilt binary for it, falls back
+to a code path that imports `triton.ops`, and newer `triton` versions
+removed that module entirely. `requirements.txt` deliberately does NOT pin
+bitsandbytes for this reason (a pin can go stale as Kaggle's base image
+updates). Fix:
+```python
+!pip install -q -U --no-deps bitsandbytes
+```
+Then restart and re-run from the install cell. If you're not sure whether
+this is already current, check the version: `import bitsandbytes;
+print(bitsandbytes.__version__)` — compare against the
+[bitsandbytes releases page](https://github.com/bitsandbytes-foundation/bitsandbytes/releases)
+to confirm you're not several versions behind.
 
 **Crash mentioning DataParallel, device mismatch, or "distributed mode"
 right at the start of training, with 2 GPUs active (running `python train.py`

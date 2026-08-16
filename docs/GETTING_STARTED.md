@@ -71,6 +71,7 @@ New cell:
 
 ```python
 !pip install -q --no-deps -r Hiraeth/scripts/requirements.txt
+!pip install -q -U --no-deps bitsandbytes
 
 import torch
 print('CUDA available:', torch.cuda.is_available(), '| GPU count:', torch.cuda.device_count())

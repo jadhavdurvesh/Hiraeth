@@ -19,10 +19,18 @@ huggingface_hub==0.27.1
 trl==0.14.0
 peft==0.19.1
 datasets==3.1.0
-bitsandbytes==0.44.1
 accelerate==1.1.1
 sentencepiece==0.2.0
 protobuf==5.28.3
+
+# bitsandbytes is deliberately NOT pinned here. It ships prebuilt binaries
+# per-CUDA-version, and an old pin (e.g. 0.44.1) can predate whatever CUDA
+# version Kaggle's current PyTorch image uses (confirmed: 0.44.1 had no
+# binary for CUDA 12.8, and its fallback path crashed on an unrelated triton
+# API change — "ModuleNotFoundError: No module named 'triton.ops'"). Always
+# install the latest bitsandbytes instead:
+#   pip install -q -U --no-deps bitsandbytes
+# (see the notebook's install cell, which already does this separately)
 
 # Optional — only needed if you want Flash Attention 2 (faster + safer
 # packing, T4 only, NOT supported on P100). Can take several minutes to
