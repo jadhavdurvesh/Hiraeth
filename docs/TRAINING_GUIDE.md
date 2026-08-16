@@ -65,13 +65,37 @@ Replace `<your-dataset-name>` and `<your-file>.jsonl` with what's actually
 under `/kaggle/input/` — run `!ls /kaggle/input/*/` first if you're not sure
 of the exact path.
 
-## 5. Run a smoke test BEFORE the full training run
+## 5. Why `torchrun`, not plain `python`
+
+This matters more than anything else in this guide for training speed.
+
+`train.py` supports two ways of using 2 GPUs:
+
+- **`device_map="auto"` (single process, no torchrun)** — splits the
+  model's *layers* across both GPUs. Every forward/backward pass has to
+  serialize activations across the GPU boundary on every layer. This is
+  what produced ~400 sec/step in earlier testing — it's not a bug exactly,
+  it's just the wrong tool: naive layer-sharding is for models too big to
+  fit on one GPU. A 7B model in 4-bit (~4.5GB) easily fits on a single 16GB
+  T4, so sharding it buys nothing but overhead.
+- **`torchrun` (proper data-parallel / DDP)** — each GPU loads its own
+  *full copy* of the model and processes its own batch independently,
+  syncing only the small LoRA gradients (0.5% of params) at the end of
+  each step. This is the standard, fast way to use multiple GPUs for a
+  model that fits on one.
+
+**Always launch with `torchrun` on 2+ GPUs.** `train.py` still works with
+plain `python train.py` (falls back to the slow layer-sharded path
+automatically, with a loud warning), but that's a fallback, not the
+intended path.
+
+## 6. Run a smoke test BEFORE the full training run
 
 This is the step most people skip, and it's the single best way to avoid
 burning hours of GPU quota on a crash or a silent slowdown.
 
 ```python
-!python Hiraeth/scripts/train.py \
+!torchrun --standalone --nproc_per_node=2 Hiraeth/scripts/train.py \
     --train_file /kaggle/working/data/train.jsonl \
     --val_file /kaggle/working/data/val.jsonl \
     --output_dir /kaggle/working/hiraeth-smoketest \
@@ -80,24 +104,28 @@ burning hours of GPU quota on a crash or a silent slowdown.
 
 This runs only 20 steps — a few minutes, not hours. Watch for:
 
-- **"Detected 2 GPU(s)"** and **"Using fp16 (GPU does not support bf16...)"**
-  printed near the top. If it says "Using bf16" on a T4/P100, something's
-  wrong with GPU detection — stop and check `nvidia-smi` output again.
-- **"Multi-GPU: marked model as already parallelized"** — confirms the fix
-  for the 2-GPU crash is active.
-- Step timing in the logs. On a T4 with the default settings, individual
-  steps should be in the **range of seconds, not minutes**. If step 1 takes
-  a while (CUDA kernel warmup/compilation is normal for the very first
-  step) but step 2+ are much faster, that's expected and fine. If EVERY
-  step takes multiple minutes, something is still wrong — see Troubleshooting.
+- **"Using DDP (data-parallel)"** printed for each rank — confirms torchrun
+  launched correctly and each process owns its own GPU. If you instead see
+  the "[warn] ... running as a SINGLE process" message, torchrun isn't
+  actually being used — double check the command.
+- **"Using fp16 (GPU does not support bf16...)"** on T4/P100. If it says
+  "Using bf16" on these GPUs, something's wrong with GPU detection.
+- **"Flash Attention 2 available"** on T4 (if you installed `flash-attn`),
+  or a clear fallback message to sdpa with packing disabled otherwise —
+  either is fine, both are handled safely now.
+- Step timing in the logs. With proper DDP on 2x T4, individual steps
+  should be in the **range of seconds, not minutes**. If step 1 takes a
+  while (CUDA kernel warmup is normal for the very first step) but step 2+
+  are much faster, that's expected. If EVERY step takes multiple minutes
+  even under torchrun, see Troubleshooting.
 
 If the smoke test finishes cleanly in a few minutes with sane step timing,
 you're clear to run the full training job.
 
-## 6. Full training run
+## 7. Full training run
 
 ```python
-!python Hiraeth/scripts/train.py \
+!torchrun --standalone --nproc_per_node=2 Hiraeth/scripts/train.py \
     --base_model Qwen/Qwen2.5-7B-Instruct \
     --train_file /kaggle/working/data/train.jsonl \
     --val_file /kaggle/working/data/val.jsonl \
@@ -109,15 +137,20 @@ you're clear to run the full training job.
     --max_seq_length 2048
 ```
 
+Note: under DDP, effective batch size = `per_device_train_batch_size ×
+gradient_accumulation_steps × num_gpus` — with the defaults above and 2
+GPUs, that's `2 × 8 × 2 = 32`, double what a single-process run would give
+you. `train.py` prints the resolved effective batch size at startup — check
+it matches what you expect.
+
 Estimate total time before committing: take the per-step time from your
 smoke test (after warmup), multiply by total steps
-(`num_train_epochs × dataset_size / effective_batch_size`, where effective
-batch size = `per_device_train_batch_size × gradient_accumulation_steps × num_gpus`).
-Compare against Kaggle's session limit (~9-12 hours) and weekly GPU quota
-(~30 hours). If it doesn't fit in one session, you'll need to add
-checkpoint-resume — not yet in `train.py`, flag it if you hit this.
+(`num_train_epochs × dataset_size / effective_batch_size`). Compare against
+Kaggle's session limit (~9-12 hours) and weekly GPU quota (~30 hours). If it
+doesn't fit in one session, you'll need checkpoint-resume — not yet in
+`train.py`, flag it if you hit this.
 
-## 7. Merge and download
+## 8. Merge and download
 
 ```python
 !python Hiraeth/scripts/merge_and_save.py \
@@ -128,36 +161,88 @@ checkpoint-resume — not yet in `train.py`, flag it if you hit this.
 !zip -r -q /kaggle/working/hiraeth-merged.zip /kaggle/working/hiraeth-merged
 ```
 Download `hiraeth-merged.zip` from the notebook's Output panel before the
-session ends — `/kaggle/working` is wiped on session close.
+session ends — `/kaggle/working` is wiped on session close. (This step
+doesn't need torchrun — it's a single-GPU merge operation, not training.)
 
 ## Troubleshooting
 
-**Crash mentioning DataParallel, device mismatch, or "distributed mode"
-right at the start of training, with 2 GPUs active:**
-Should now be fixed by the `is_parallelizable`/`model_parallel` flags added
-to `train.py`. If you still hit this, you're likely on an older cached
-version of the script — re-`git pull` or re-clone the repo.
+**`ModuleNotFoundError: No module named 'trl'` (or transformers/peft/etc):**
+The install step didn't complete. Re-run Step 3's `pip install --no-deps -r requirements.txt`
+and check the pip output for errors — don't skip straight to running `train.py`.
 
-**Every step takes multiple minutes, no exceptions:**
-1. Confirm the "Using fp16" log line appeared (see Step 5) — bf16 on
-   T4/P100 is the most common cause of this exact symptom.
-2. Confirm `torch.cuda.is_available()` is `True` and GPUs show up in
+**`TypeError: SFTConfig.__init__() got an unexpected keyword argument '...'`:**
+This should no longer happen — `train.py` now inspects the installed trl
+version's actual `SFTConfig` signature and drops/renames unsupported
+arguments with a warning instead of crashing (see `build_sft_config` in the
+script). If you still see this exact crash, you're on an old cached version
+of the script — re-`git pull` or re-clone the repo.
+
+**`ImportError: tokenizers>=X,<Y is required but found Z` (or the same for
+huggingface-hub):** A version mismatch between transformers and its
+dependencies. Reinstall using the exact pins in `scripts/requirements.txt`
+(these versions are confirmed to work together) — don't mix-and-match by
+installing one package at its latest version while others stay pinned.
+
+**`PackageNotFoundError: No package metadata was found for bitsandbytes`:**
+bitsandbytes didn't install correctly. Re-run
+`pip install --no-deps bitsandbytes==0.44.1` on its own and check for errors
+before continuing.
+
+**Crash mentioning DataParallel, device mismatch, or "distributed mode"
+right at the start of training, with 2 GPUs active (running `python train.py`
+directly, no torchrun):**
+This is the naive-sharding fallback path, not the recommended path — see
+Step 5. Switch to `torchrun --standalone --nproc_per_node=2 train.py ...`
+instead, which uses proper DDP and avoids this entirely. If you still hit
+this crash *while using torchrun*, that's unexpected — please report it.
+
+**`torch.OutOfMemoryError: CUDA out of memory` on one GPU while the other
+has room:**
+This is a symptom of the naive single-process sharding path (`device_map=
+"auto"`), which splits layers unevenly across GPUs — one GPU can end up
+holding more of the model's activations than the other. Switching to
+`torchrun` (proper DDP, each GPU holds a symmetric full copy) should
+resolve this. If OOM still happens under torchrun, lower
+`--per_device_train_batch_size` to 1 and raise
+`--gradient_accumulation_steps` proportionally to keep the same effective
+batch size, or lower `--max_seq_length`.
+
+**Every step takes multiple minutes (~400 sec/step or similar), even with
+2 GPUs "detected":**
+1. Confirm you launched with `torchrun --standalone --nproc_per_node=2`,
+   not plain `python train.py` — this is the single biggest cause of this
+   exact symptom (see Step 5's explanation of naive sharding vs. DDP).
+2. Confirm the "Using fp16" log line appeared — bf16 on T4/P100 is a
+   second common cause of the same symptom.
+3. Confirm `torch.cuda.is_available()` is `True` and GPUs show up in
    `nvidia-smi` mid-training (run `!nvidia-smi` in a separate cell while
    training runs) — if GPU utilization is near 0%, training is likely
    running on CPU, which usually means the earlier `--no-deps` step was
    skipped and torch got upgraded to a CUDA-incompatible version.
-3. Check you're not accidentally using `--lora_preset large` combined with
-   a long `--max_seq_length` on a single GPU with limited headroom — try
-   the smoke test with `--lora_preset standard` (the default) first.
+
+**"Padding-free training is enabled but the attention implementation is
+not a supported Flash Attention variant" / packing cross-contamination
+warning:**
+Should no longer appear — `train.py` now checks GPU compute capability and
+whether `flash-attn` is installed, and automatically disables packing
+(falling back to `sdpa`) if Flash Attention 2 isn't actually available,
+rather than proceeding with the unsafe combination. If you want full
+packing speed on T4, install Flash Attention 2 first:
+`pip install flash-attn --no-build-isolation` (can take several minutes to
+build). Not supported on P100 regardless (compute capability too low).
 
 **Training appears frozen after the first step:**
-Should now be fixed by `dataloader_num_workers=0` (Kaggle notebooks are
-known to hang with multi-worker DataLoaders). If it still happens, check
-whether it's actually frozen (GPU utilization at 0% in `nvidia-smi`) or
-just quiet — with `--logging_steps 5` you'll get a log line every 5 steps,
-so brief silence between logs is normal, not a freeze.
+Should be fixed by `dataloader_num_workers=0` (Kaggle notebooks are known
+to hang with multi-worker DataLoaders). If it still happens, check whether
+it's actually frozen (GPU utilization at 0% in `nvidia-smi`) or just quiet
+— with `--logging_steps 5` you'll get a log line every 5 steps, so brief
+silence between logs is normal, not a freeze.
 
-**Out of memory (OOM) errors:**
-Lower `--per_device_train_batch_size` to 1 and raise
-`--gradient_accumulation_steps` proportionally to keep the same effective
-batch size, or lower `--max_seq_length`.
+**Large list of pip dependency-conflict warnings (google-colab, cudf,
+numba, torchvision, etc.) during install:**
+These are almost always about *other* preinstalled Kaggle packages
+unrelated to this training pipeline, not the actual cause of a training
+failure. Don't chase every one of these down — focus on whether `import
+torch; import transformers; import trl; import peft; import bitsandbytes`
+all succeed and `torch.cuda.is_available()` is `True` after install; that's
+what actually matters for training.

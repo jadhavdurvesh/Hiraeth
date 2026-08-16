@@ -37,7 +37,7 @@ Being upfront about this since it matters for anyone picking this up:
 | Piece | Status |
 |---|---|
 | `prepare_dataset.py` | Logic verified locally against the Hiraeth Atlas schema. Converts DMJ/Atlas records into chat-formatted JSONL correctly. |
-| `train.py` | Fixed two real bugs reported from an actual Kaggle run: a multi-GPU crash (Trainer conflicting with `device_map="auto"` sharding) and extreme slowness from hardcoded bf16 on T4/P100 (which don't support it in hardware). Also added a `--max_steps` smoke-test mode and fixed a likely DataLoader-hang cause. Still needs a full run on Kaggle to confirm the fixes hold end-to-end. |
+| `train.py` | Rewritten after a real Kaggle run surfaced two deeper issues beyond the earlier fixes: (1) `device_map="auto"` naive layer-sharding across 2 GPUs was the actual cause of ~400 sec/step and uneven OOM — switched to proper `torchrun`-based DDP (each GPU gets a full model copy) as the recommended path, with the old naive-sharding kept only as an automatic single-process fallback; (2) hardcoded `SFTConfig` kwargs (`max_seq_length`, `warmup_ratio`) crashed on a differently-versioned installed `trl` — now inspects the installed API and drops/renames unsupported args with a warning instead of crashing. Also added real Flash Attention 2 support on T4 (auto-detected, safely falls back to disabling packing if unavailable). `requirements.txt` now pins the exact version combo confirmed to work end-to-end on Kaggle. Still needs a full run to confirm the DDP path performs as expected — the logic has been tested standalone (SFTConfig filtering, FA2/packing resolution, distributed detection) but not against a live GPU. |
 | `merge_and_save.py` | Written and syntax-checked, same caveat — needs an actual trained adapter to merge. |
 | `chat.py` | Written and syntax-checked, includes per-turn and session token-usage reporting. Not yet run against a real trained model. |
 | `notebook/hiraeth_train.ipynb` | Wired up to clone this repo, pull a Kaggle-Dataset-attached Hiraeth Atlas file, and run the full pipeline. Not yet executed on Kaggle. |
@@ -118,6 +118,20 @@ things worth knowing:
 - This is a **real tokenizer count**, different from the `estimated_tokens`
   field in Hiraeth Atlas metadata, which is a rough word-count estimate used
   during dataset prep — not the same number.
+
+## Multi-GPU strategy
+
+**Always launch training with `torchrun`, not plain `python`:**
+```bash
+torchrun --standalone --nproc_per_node=2 scripts/train.py --train_file ... --val_file ...
+```
+This runs proper data-parallel (DDP) training — each GPU loads its own full
+model copy and processes its own batch, syncing only LoRA gradients. A
+naive `device_map="auto"` single-process fallback exists for convenience
+(or single-GPU use), but it splits the model's *layers* across GPUs instead
+of replicating it — this serializes activations across the GPU boundary on
+every layer and was the confirmed cause of ~400 sec/step and uneven OOM in
+real testing. See `docs/TRAINING_GUIDE.md` for the full explanation.
 
 ## Design notes
 

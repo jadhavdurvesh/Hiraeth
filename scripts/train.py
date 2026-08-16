@@ -1,48 +1,60 @@
 """
 train.py — QLoRA fine-tuning for Hiraeth
 ------------------------------------------
-Runs in a single Kaggle notebook process. Uses 4-bit QLoRA and
-device_map="auto" so the base model is automatically sharded across
-both GPUs (no torchrun/accelerate-launch needed inside a notebook cell,
-which avoids the usual multi-process headaches on Kaggle).
+Two ways to run this, and the choice matters a lot for speed:
+
+  RECOMMENDED — true multi-GPU data-parallel (DDP) via torchrun:
+    Each GPU loads its own full copy of the quantized model and processes
+    its own batch shard independently, only syncing LoRA gradients at the
+    end of each step. This is the fast, standard way to use multiple GPUs
+    for QLoRA fine-tuning of a model that fits on a single GPU (a 7B model
+    in 4-bit is ~4.5GB — comfortably fits on one 16GB T4).
+
+      !torchrun --standalone --nproc_per_node=2 train.py \
+          --train_file ../data/train.jsonl \
+          --val_file ../data/val.jsonl \
+          --output_dir /kaggle/working/hiraeth-qlora
+
+  FALLBACK — single process, `device_map="auto"` (naive pipeline
+  parallelism): splits the model's LAYERS across GPUs instead of
+  replicating it. Every forward/backward pass has to serialize activations
+  across the GPU boundary on every layer — this is dramatically slower
+  than DDP (this was very likely the cause of ~400 sec/step in testing) and
+  can also OOM unevenly across GPUs. Only used automatically if you run
+  `python train.py` directly without torchrun. Fine for a single GPU;
+  avoid it for 2+ GPUs if you can use torchrun instead.
+
+    !python train.py --train_file ... --val_file ...   # single GPU, or
+                                                          # naive multi-GPU fallback
 
 Base model default: Qwen/Qwen2.5-7B-Instruct
   - Apache-2.0 licensed, strong general + code performance
-  - 4-bit QLoRA fits within 2x 16GB (T4/P100) with room for activations
+  - 4-bit QLoRA fits comfortably on a single 16GB T4/P100
 
-Swap --base_model to a smaller model (e.g. Qwen/Qwen2.5-3B-Instruct or
-meta-llama/Llama-3.2-3B-Instruct) if you want faster iteration first.
+Robustness against TRL API drift: different trl versions accept different
+SFTConfig keyword arguments (this caused real crashes: `max_seq_length` and
+`warmup_ratio` being rejected with "unexpected keyword argument" on some
+installed versions). This script now inspects the installed SFTConfig's
+actual signature, remaps known renamed args (e.g. max_seq_length ->
+max_length in newer trl), and drops+warns on anything unsupported instead
+of crashing outright.
 
-Enabled by default (see argparse help below for details):
-  - Packing: concatenates short examples into full-length blocks -> better
-    GPU utilization, faster training for the same GPU-hours.
-  - NEFTune (alpha=5): noise on input embeddings during training, known to
-    improve instruction-following quality at no extra compute cost.
-  - LoRA preset "standard" (r=16, alpha=32) — pass --lora_preset large for
-    r=32/alpha=64 if you want more adapter capacity on a bigger dataset.
+Flash Attention 2: enabled automatically when packing is on AND the GPU's
+compute capability supports it (>=7.5 — T4 qualifies, P100 does not).
+Falls back to sdpa + packing disabled if flash-attn isn't installed or the
+GPU doesn't support it, avoiding the cross-sample-contamination risk TRL
+warns about when packing without FA2.
 
-Fixes for known Kaggle 2-GPU issues (see docs/TRAINING_GUIDE.md for details):
-  - Crash on 2 GPUs: Trainer was trying to also wrap the already-sharded
-    (device_map="auto") model for multi-GPU DataParallel, conflicting with
-    it. Fixed by marking the model as already parallelized.
-  - Extremely slow / stuck training on 1 GPU: was hardcoded to bf16, which
-    T4 and P100 (Kaggle's free GPUs) don't have real hardware support for.
-    Now auto-detects and uses fp16 on GPUs without bf16 support.
-  - Apparent freeze after step 1: Kaggle notebooks are known to hang with
-    multi-worker DataLoaders. Now forces dataloader_num_workers=0.
-  - Use --max_steps 20 for a quick smoke test before committing to a full run.
+Usage:
 
-Usage (inside a Kaggle notebook cell, GPU T4 x2 or P100 x2 enabled):
-
-  # Quick smoke test first — confirms the pipeline works, ~5-10 min:
-  !python train.py \
-      --train_file ../data/train.jsonl \
-      --val_file ../data/val.jsonl \
-      --output_dir /kaggle/working/hiraeth-smoketest \
-      --max_steps 20
+  # Quick smoke test first (works with or without torchrun) — confirms the
+  # pipeline works, a few minutes:
+  !torchrun --standalone --nproc_per_node=2 train.py \
+      --train_file ../data/train.jsonl --val_file ../data/val.jsonl \
+      --output_dir /kaggle/working/hiraeth-smoketest --max_steps 20
 
   # Full run:
-  !python train.py \
+  !torchrun --standalone --nproc_per_node=2 train.py \
       --base_model Qwen/Qwen2.5-7B-Instruct \
       --train_file ../data/train.jsonl \
       --val_file ../data/val.jsonl \
@@ -54,13 +66,14 @@ Usage (inside a Kaggle notebook cell, GPU T4 x2 or P100 x2 enabled):
       --max_seq_length 2048
 
   # Try the larger LoRA preset instead:
-  !python train.py ... --lora_preset large
+  !torchrun ... train.py ... --lora_preset large
 
   # Disable NEFTune or packing if you want the plain baseline behavior:
-  !python train.py ... --neftune_alpha 0 --packing false
+  !torchrun ... train.py ... --neftune_alpha 0 --packing false
 """
 
 import argparse
+import inspect
 import os
 
 import torch
@@ -87,10 +100,6 @@ def parse_args():
     ap.add_argument("--learning_rate", type=float, default=2e-4)
     ap.add_argument("--max_seq_length", type=int, default=2048)
 
-    # LoRA rank/alpha: choose a preset, or override r/alpha manually.
-    # "standard" (r=16, alpha=32) — lighter, faster, less VRAM. Good default.
-    # "large" (r=32, alpha=64) — more adapter capacity, more VRAM/time.
-    #   Worth trying if standard underfits on a larger (50k+) dataset.
     ap.add_argument(
         "--lora_preset", choices=["standard", "large"], default="standard",
         help="standard = r16/alpha32 (default). large = r32/alpha64 (more capacity, more VRAM/time).",
@@ -99,21 +108,14 @@ def parse_args():
     ap.add_argument("--lora_alpha", type=int, default=None, help="Overrides --lora_preset if set")
     ap.add_argument("--lora_dropout", type=float, default=0.05)
 
-    # NEFTune: adds noise to input embeddings during training, which has been shown
-    # to improve instruction-following quality at ~no extra compute cost.
-    # Set to 0 to disable. 5 is the commonly-used default from the NEFTune paper.
     ap.add_argument(
         "--neftune_alpha", type=float, default=5.0,
         help="NEFTune noise alpha. 0 disables NEFTune entirely.",
     )
-
-    # Packing: concatenates multiple short examples into one max_seq_length block
-    # instead of padding each example individually. Meaningfully improves GPU
-    # utilization/training speed on datasets with lots of short examples — matters
-    # on Kaggle's limited weekly GPU-hour quota. Default on; disable if you need
-    # each example to stay in its own attention window (e.g. very long single examples).
     ap.add_argument("--packing", type=lambda x: x.lower() != "false", default=True,
-                     help="Pass --packing false to disable")
+                     help="Pass --packing false to disable. Auto-disabled if Flash Attention 2 "
+                          "isn't available, regardless of this flag, to avoid cross-sample "
+                          "attention contamination.")
 
     ap.add_argument("--logging_steps", type=int, default=5)
     ap.add_argument("--save_steps", type=int, default=200)
@@ -123,8 +125,7 @@ def parse_args():
     ap.add_argument(
         "--max_steps", type=int, default=-1,
         help="Cap total training steps. Use a small number (e.g. 20) for a quick "
-             "smoke test to confirm the pipeline works before committing to a full run. "
-             "-1 (default) means no cap — train for the full num_train_epochs.",
+             "smoke test before committing to a full run. -1 = no cap.",
     )
     return ap.parse_args()
 
@@ -132,30 +133,122 @@ def parse_args():
 LORA_PRESETS = {"standard": (16, 32), "large": (32, 64)}
 
 
+def resolve_distributed():
+    """Detect whether we're running under torchrun (proper DDP) or as a
+    single process (naive fallback for multi-GPU, or just single-GPU)."""
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_distributed = local_rank != -1 and world_size > 1
+    return is_distributed, local_rank, world_size
+
+
+def resolve_attention_and_packing(packing_requested, n_gpus):
+    """
+    Decide attn_implementation + whether packing can safely stay on.
+    FA2 needs compute capability >= 7.5 (T4 qualifies, P100 does not) and
+    the flash-attn package installed. Without FA2, packing risks
+    cross-sample attention contamination (the exact warning TRL gives) —
+    so we disable packing rather than silently accept that risk.
+    """
+    if not torch.cuda.is_available():
+        return "sdpa", False
+
+    major, minor = torch.cuda.get_device_capability(0)
+    supports_fa2 = (major, minor) >= (7, 5)
+
+    if not packing_requested:
+        return "sdpa", False
+
+    if not supports_fa2:
+        print(f"[warn] GPU compute capability {major}.{minor} doesn't support Flash Attention 2 "
+              f"(needs >=7.5 — T4 qualifies, P100 does not). Disabling packing, using sdpa "
+              f"to avoid cross-sample attention contamination.")
+        return "sdpa", False
+
+    try:
+        import flash_attn  # noqa: F401
+        print("Flash Attention 2 available — using it with packing enabled.")
+        return "flash_attention_2", True
+    except ImportError:
+        print("[warn] Packing requested and GPU supports Flash Attention 2, but the `flash-attn` "
+              "package isn't installed. Disabling packing, using sdpa instead. To get full packing "
+              "speed, install it with: pip install flash-attn --no-build-isolation "
+              "(can take several minutes to build).")
+        return "sdpa", False
+
+
+def build_sft_config(**kwargs):
+    """
+    Filters kwargs against the ACTUALLY INSTALLED trl version's SFTConfig
+    signature, remapping known renamed args, and dropping (with a warning)
+    anything unsupported instead of crashing. This is what fixes the
+    'unexpected keyword argument max_seq_length / warmup_ratio' crashes —
+    those happen when the installed trl version's API doesn't match what
+    the script assumes.
+    """
+    sig = inspect.signature(SFTConfig.__init__)
+    accepted = set(sig.parameters.keys())
+
+    # Known cross-version renames in trl's SFTConfig
+    rename_map = {"max_seq_length": "max_length"}
+
+    filtered = {}
+    dropped = []
+    for key, value in kwargs.items():
+        if key in accepted:
+            filtered[key] = value
+        elif key in rename_map and rename_map[key] in accepted:
+            filtered[rename_map[key]] = value
+            print(f"[info] renamed '{key}' -> '{rename_map[key]}' for installed trl version")
+        else:
+            dropped.append(key)
+
+    if dropped:
+        print(f"[warn] installed trl's SFTConfig doesn't support these args, using its defaults "
+              f"instead (this is non-fatal): {dropped}")
+
+    return SFTConfig(**filtered)
+
+
 def main():
     args = parse_args()
 
-    # Resolve LoRA r/alpha: explicit --lora_r/--lora_alpha wins, else use the preset
     preset_r, preset_alpha = LORA_PRESETS[args.lora_preset]
     lora_r = args.lora_r if args.lora_r is not None else preset_r
     lora_alpha = args.lora_alpha if args.lora_alpha is not None else preset_alpha
     print(f"LoRA config: r={lora_r}, alpha={lora_alpha} "
           f"({'explicit override' if args.lora_r is not None else f'preset: {args.lora_preset}'})")
 
+    is_distributed, local_rank, world_size = resolve_distributed()
     n_gpus = torch.cuda.device_count()
-    print(f"Detected {n_gpus} GPU(s)")
+    print(f"Detected {n_gpus} GPU(s) visible" + (f", running distributed rank {local_rank}/{world_size}" if is_distributed else ""))
     for i in range(n_gpus):
         print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
 
-    # T4 and P100 (Kaggle's free GPUs) do NOT have real hardware bf16 support —
-    # that requires Ampere or newer (compute capability 8.0+). Using bf16 on
-    # these GPUs silently falls back to slow, unaccelerated math, which is very
-    # likely the cause of multi-minute-per-step training. Detect and use fp16
-    # instead on older GPUs.
+    if is_distributed:
+        # Proper DDP: each process loads its own full model copy pinned to
+        # its own GPU. Trainer auto-detects torchrun's env vars and handles
+        # gradient sync across processes — no extra code needed for that part.
+        device_map = {"": local_rank}
+        print(f"Using DDP (data-parallel): this process owns GPU {local_rank}, "
+              f"loading a full model copy there. This is the fast multi-GPU path.")
+    elif n_gpus > 1:
+        device_map = "auto"
+        print(f"[warn] {n_gpus} GPUs visible but running as a SINGLE process (no torchrun). "
+              f"Falling back to naive layer-sharding across GPUs (device_map='auto') — this is "
+              f"MUCH slower than proper DDP (activations serialize across the GPU boundary on "
+              f"every layer; this is very likely the cause of extremely slow steps like "
+              f"~400 sec/step). Strongly recommended: relaunch with torchrun instead:\n"
+              f"  torchrun --standalone --nproc_per_node={n_gpus} train.py ...")
+    else:
+        device_map = "auto"  # single GPU — harmless, no sharding needed
+
     use_bf16 = n_gpus > 0 and torch.cuda.is_bf16_supported()
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float16
     print(f"Using {'bf16' if use_bf16 else 'fp16'} "
           f"({'GPU supports bf16' if use_bf16 else 'GPU does not support bf16 (T4/P100) — using fp16 instead'})")
+
+    attn_implementation, packing = resolve_attention_and_packing(args.packing, n_gpus)
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -169,28 +262,21 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # device_map="auto" shards the model across BOTH visible GPUs
-    # (this is model-parallel sharding, not DDP — the right choice for
-    # a single-process Kaggle notebook cell with 2 GPUs).
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         quantization_config=bnb_config,
-        device_map="auto",
+        device_map=device_map,
+        attn_implementation=attn_implementation,
         trust_remote_code=True,
     )
     model.config.use_cache = False
 
-    # IMPORTANT multi-GPU fix: when a model is loaded with device_map="auto"
-    # across multiple GPUs, HF Trainer doesn't automatically know the model
-    # already handles its own multi-GPU placement (naive pipeline parallelism).
-    # Without these two flags, Trainer tries to ALSO wrap the model for
-    # multi-GPU (DataParallel), which conflicts with the existing device split
-    # and crashes. This is almost certainly what caused the crash on 2 GPUs.
-    if n_gpus > 1:
+    # Only needed for the naive single-process multi-GPU fallback — DDP
+    # (is_distributed=True) doesn't need these, Trainer handles it natively
+    # via torchrun's env vars.
+    if not is_distributed and n_gpus > 1:
         model.is_parallelizable = True
         model.model_parallel = True
-        print("Multi-GPU: marked model as already parallelized (prevents Trainer "
-              "from wrapping it in DataParallel, which is what likely crashed before)")
 
     model = prepare_model_for_kbit_training(model)
 
@@ -222,7 +308,7 @@ def main():
 
     dataset = dataset.map(format_example, remove_columns=dataset["train"].column_names)
 
-    sft_config = SFTConfig(
+    sft_config = build_sft_config(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
         max_steps=args.max_steps,
@@ -247,19 +333,16 @@ def main():
         report_to="none",
         seed=args.seed,
         dataset_text_field="text",
-        packing=args.packing,
+        packing=packing,
         neftune_noise_alpha=args.neftune_alpha if args.neftune_alpha > 0 else None,
-        # Kaggle notebooks are known to hang with multi-worker DataLoaders due to
-        # /dev/shm restrictions in the container — this was very likely the cause
-        # of training appearing to "freeze" after the first step. 0 = load data in
-        # the main process, no subprocess hangs.
         dataloader_num_workers=0,
-        # Print a running average of tokens/sec and step timing so it's clear
-        # whether training is actually progressing, not just guessing from silence
-        # between logging_steps.
         logging_first_step=True,
-        include_num_input_tokens_seen=True,
     )
+
+    effective_batch = args.per_device_train_batch_size * args.gradient_accumulation_steps * max(world_size, 1)
+    print(f"Effective batch size: {effective_batch} "
+          f"({args.per_device_train_batch_size} per-device x {args.gradient_accumulation_steps} "
+          f"grad-accum x {max(world_size, 1)} process(es))")
 
     trainer = SFTTrainer(
         model=model,
