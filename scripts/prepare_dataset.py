@@ -46,6 +46,7 @@ import json
 import os
 import random
 from collections import Counter
+from pathlib import Path
 
 
 def load_jsonl(path):
@@ -80,9 +81,57 @@ def to_chat_messages(record, system_prompt):
     return messages
 
 
+def find_kaggle_input_jsonl():
+    """
+    Auto-detects a dataset .jsonl file under /kaggle/input/ so you don't have
+    to hardcode a dataset folder name or filename that matches whatever you
+    happened to name it when uploading. Only looks at top-level files inside
+    each attached dataset folder (Kaggle datasets are usually flat).
+
+    Returns the single found path, or raises a clear error listing what it
+    found (or didn't find) so you can pass --input explicitly if needed.
+    """
+    input_root = Path("/kaggle/input")
+    if not input_root.exists():
+        raise FileNotFoundError(
+            "No --input given and /kaggle/input doesn't exist (not running on "
+            "Kaggle, or no dataset attached). Pass --input explicitly."
+        )
+
+    candidates = sorted(input_root.glob("*/*.jsonl"))
+
+    # Prefer files that look like Atlas/DMJ output over anything else if there
+    # happen to be several — but don't be clever about it beyond that; ambiguity
+    # should surface to the user rather than silently guessing wrong.
+    if len(candidates) == 1:
+        print(f"Auto-detected dataset file: {candidates[0]}")
+        return str(candidates[0])
+
+    if len(candidates) == 0:
+        raise FileNotFoundError(
+            "No --input given and no .jsonl files found under /kaggle/input/. "
+            "Make sure you attached your dataset via 'Add Input' in the Kaggle "
+            "notebook sidebar, or pass --input explicitly."
+        )
+
+    # Multiple .jsonl files found — don't guess, list them so the user can pick
+    listing = "\n".join(f"  - {c}" for c in candidates)
+    raise FileNotFoundError(
+        f"No --input given and multiple .jsonl files found under /kaggle/input/:\n"
+        f"{listing}\n"
+        f"Pass --input explicitly with the one you want, e.g.:\n"
+        f"  --input {candidates[0]}"
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Path to DMJ final merged JSONL")
+    ap.add_argument(
+        "--input", default=None,
+        help="Path to DMJ/Atlas final merged JSONL. If omitted, auto-detects a "
+             "single .jsonl file under /kaggle/input/ (fails with a clear message "
+             "if zero or multiple are found).",
+    )
     ap.add_argument("--output_dir", default="../data")
     ap.add_argument("--val_split", type=float, default=0.02)
     ap.add_argument(
@@ -97,6 +146,9 @@ def main():
     ap.add_argument("--max_examples", type=int, default=None)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+
+    if args.input is None:
+        args.input = find_kaggle_input_jsonl()
 
     random.seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)

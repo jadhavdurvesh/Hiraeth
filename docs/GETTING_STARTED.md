@@ -27,8 +27,8 @@ That's it. Everything else happens inside Kaggle.
 4. Give it a name you'll remember, e.g. `hiraeth-atlas`.
 5. Click **Create**.
 
-Once it's done uploading, note the exact **filename** you uploaded — you'll
-need it in Step 5.
+That's it — you don't need to remember the exact filename. The training
+scripts later auto-detect whatever `.jsonl` file you attach.
 
 ---
 
@@ -85,19 +85,20 @@ the GPUs actually being usable.
 
 ## Step 5: Turn your dataset into training format
 
-New cell — **replace the two `<...>` parts** with your actual dataset
-folder name (from Step 1) and filename:
+New cell:
 
 ```python
 !mkdir -p /kaggle/working/data
 !python Hiraeth/scripts/prepare_dataset.py \
-    --input /kaggle/input/<your-dataset-folder-name>/<your-filename>.jsonl \
     --output_dir /kaggle/working/data \
     --val_split 0.02
 ```
 
-Not sure of the exact folder/file name? Run `!ls /kaggle/input/*/` in a
-cell first — it'll show you exactly what's there.
+Notice there's no filename to fill in — it automatically finds the dataset
+file you attached in Step 2. If you attached more than one dataset with a
+`.jsonl` file in it, it'll print all the ones it found and ask you to
+specify which one with `--input /kaggle/input/<folder>/<file>.jsonl`, but
+for a normal single-dataset setup this just works.
 
 ---
 

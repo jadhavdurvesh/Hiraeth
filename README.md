@@ -87,8 +87,9 @@ Short version:
    (`python build.py all`), upload the resulting JSONL as a Kaggle Dataset.
 2. New Kaggle notebook → Settings → **GPU T4 x2**, **Internet: On** → attach
    your dataset via Add Input.
-3. Open `notebook/hiraeth_train.ipynb`, set `DATASET_NAME` and
-   `RAW_FILENAME` at the top of the relevant cells to match your setup.
+3. Open `notebook/hiraeth_train.ipynb` and run it — the dataset step
+   auto-detects your attached file under `/kaggle/input/`, no filenames to
+   edit.
 4. Run top to bottom — includes a 20-step smoke test before the full
    training run, and an eval spot-check after merging.
 
