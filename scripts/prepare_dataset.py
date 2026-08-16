@@ -81,12 +81,51 @@ def to_chat_messages(record, system_prompt):
     return messages
 
 
+def _looks_like_jsonl_dataset(path, sample_lines=3):
+    """
+    Sanity-checks a candidate file actually looks like Hiraeth Atlas data —
+    not just any valid JSON, but JSONL where each line has the expected
+    shape (Atlas records: instruction/output; or pre-formatted chat data:
+    messages). This is what stops a generic config.json or similar
+    unrelated file from being silently picked just because it happens to
+    parse as JSON. Reads only the first few lines, not the whole file —
+    this runs against every candidate, so it needs to stay cheap even on a
+    100k+ record file.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            checked = 0
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)  # raises if not valid JSON on its own line
+                if not isinstance(record, dict):
+                    return False
+                has_atlas_shape = "instruction" in record and "output" in record
+                has_chat_shape = "messages" in record
+                if not (has_atlas_shape or has_chat_shape):
+                    return False
+                checked += 1
+                if checked >= sample_lines:
+                    return True
+        return checked > 0
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return False
+
+
 def find_kaggle_input_jsonl():
     """
-    Auto-detects a dataset .jsonl file under /kaggle/input/ so you don't have
-    to hardcode a dataset folder name or filename that matches whatever you
-    happened to name it when uploading. Only looks at top-level files inside
-    each attached dataset folder (Kaggle datasets are usually flat).
+    Auto-detects a dataset file under /kaggle/input/ so you don't have to
+    hardcode a dataset folder name or filename that matches whatever you
+    happened to name it when uploading.
+
+    Searches recursively (Kaggle datasets are usually flat, but not always),
+    looks at both .jsonl AND .json extensions (Hiraeth Atlas has been
+    uploaded as either), skips Kaggle's own auto-generated metadata files,
+    and validates each candidate actually contains one-JSON-object-per-line
+    content before trusting it — so a stray unrelated .json file won't be
+    silently picked.
 
     Returns the single found path, or raises a clear error listing what it
     found (or didn't find) so you can pass --input explicitly if needed.
@@ -98,29 +137,44 @@ def find_kaggle_input_jsonl():
             "Kaggle, or no dataset attached). Pass --input explicitly."
         )
 
-    candidates = sorted(input_root.glob("*/*.jsonl"))
+    # Kaggle auto-adds files like dataset-metadata.json to every dataset —
+    # these aren't your data, filter them out by name.
+    ignored_names = {"dataset-metadata.json"}
 
-    # Prefer files that look like Atlas/DMJ output over anything else if there
-    # happen to be several — but don't be clever about it beyond that; ambiguity
-    # should surface to the user rather than silently guessing wrong.
-    if len(candidates) == 1:
-        print(f"Auto-detected dataset file: {candidates[0]}")
-        return str(candidates[0])
+    raw_candidates = sorted(
+        p for p in list(input_root.rglob("*.jsonl")) + list(input_root.rglob("*.json"))
+        if p.name not in ignored_names
+    )
 
-    if len(candidates) == 0:
+    valid_candidates = [p for p in raw_candidates if _looks_like_jsonl_dataset(p)]
+
+    if len(valid_candidates) == 1:
+        print(f"Auto-detected dataset file: {valid_candidates[0]}")
+        return str(valid_candidates[0])
+
+    if len(valid_candidates) == 0:
+        if raw_candidates:
+            listing = "\n".join(f"  - {c}" for c in raw_candidates)
+            raise FileNotFoundError(
+                f"No --input given. Found .json/.jsonl files under /kaggle/input/, but none of "
+                f"them look like valid one-JSON-object-per-line data (each line should be its own "
+                f"JSON record):\n{listing}\n"
+                f"If one of these IS your dataset, check it's actually JSONL formatted, or pass "
+                f"--input explicitly to use it anyway."
+            )
         raise FileNotFoundError(
-            "No --input given and no .jsonl files found under /kaggle/input/. "
-            "Make sure you attached your dataset via 'Add Input' in the Kaggle "
-            "notebook sidebar, or pass --input explicitly."
+            "No --input given and no .json/.jsonl files found anywhere under /kaggle/input/. "
+            "Make sure you attached your dataset via 'Add Input' in the Kaggle notebook sidebar "
+            "(check with `!ls -R /kaggle/input/` in a cell), or pass --input explicitly."
         )
 
-    # Multiple .jsonl files found — don't guess, list them so the user can pick
-    listing = "\n".join(f"  - {c}" for c in candidates)
+    # Multiple valid candidates found — don't guess, list them so the user can pick
+    listing = "\n".join(f"  - {c}" for c in valid_candidates)
     raise FileNotFoundError(
-        f"No --input given and multiple .jsonl files found under /kaggle/input/:\n"
-        f"{listing}\n"
+        f"No --input given and multiple valid-looking dataset files found under "
+        f"/kaggle/input/:\n{listing}\n"
         f"Pass --input explicitly with the one you want, e.g.:\n"
-        f"  --input {candidates[0]}"
+        f"  --input {valid_candidates[0]}"
     )
 
 
