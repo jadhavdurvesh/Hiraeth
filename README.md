@@ -26,6 +26,7 @@ Hiraeth/
 ├── notebook/
 │   └── hiraeth_train.ipynb  # Kaggle notebook: clone -> prep -> smoke test -> train -> merge -> eval -> zip
 └── docs/
+    ├── GETTING_STARTED.md   # simple, plain-language step-by-step walkthrough
     ├── TRAINING_GUIDE.md    # step-by-step Kaggle guide with troubleshooting
     └── PLANNING.md          # archived original design doc
 ```
@@ -70,10 +71,14 @@ Hiraeth-Forge (separate repo)
 
 ## Quick start (on Kaggle)
 
-**For the full walkthrough with troubleshooting, read
-[`docs/TRAINING_GUIDE.md`](docs/TRAINING_GUIDE.md) — it covers real issues
+**New to this? Start with
+[`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md)** — a simple,
+plain-language walkthrough with no assumed background.
+
+**For the deeper technical guide with troubleshooting, read
+[`docs/TRAINING_GUIDE.md`](docs/TRAINING_GUIDE.md)** — it covers real issues
 people have hit (multi-GPU crashes, bf16-on-T4 slowdowns, apparent
-freezes) and exactly what to check at each step.**
+freezes) and exactly what to check at each step.
 
 Short version:
 
