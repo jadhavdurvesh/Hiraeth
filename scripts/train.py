@@ -68,10 +68,10 @@ Usage:
       --val_file ../data/val.jsonl \
       --output_dir /kaggle/working/hiraeth-qlora \
       --num_train_epochs 3 \
-      --per_device_train_batch_size 2 \
-      --gradient_accumulation_steps 8 \
+      --per_device_train_batch_size 1 \
+      --gradient_accumulation_steps 16 \
       --learning_rate 2e-4 \
-      --max_seq_length 2048
+      --max_seq_length 1024
 
   # Try the larger LoRA preset instead:
   !torchrun ... train.py ... --lora_preset large
