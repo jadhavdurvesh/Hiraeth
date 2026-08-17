@@ -31,6 +31,14 @@ Base model default: Qwen/Qwen2.5-7B-Instruct
   - Apache-2.0 licensed, strong general + code performance
   - 4-bit QLoRA fits comfortably on a single 16GB T4/P100
 
+DDP hang prevention: under torchrun, each process now explicitly calls
+torch.cuda.set_device(local_rank) before any distributed communication.
+Without this, NCCL "guesses" which physical GPU each rank owns from the
+global rank number — its own warning literally says this "can cause a hang
+if rank to GPU mapping is heterogeneous". Symptom if this happens: both
+GPUs show ~100% utilization (NCCL busy-waits on a stuck collective) but the
+training step count never advances past 0. This fix removes that guesswork.
+
 Robustness against TRL API drift: different trl versions accept different
 SFTConfig keyword arguments (this caused real crashes: `max_seq_length` and
 `warmup_ratio` being rejected with "unexpected keyword argument" on some
@@ -226,6 +234,16 @@ def main():
         print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
 
     if is_distributed:
+        # Explicitly pin this process to its GPU BEFORE any distributed
+        # communication happens. Without this, NCCL has to "guess" which
+        # device each rank owns from the global rank number alone — which
+        # its own warning says "can cause a hang if rank to GPU mapping is
+        # heterogeneous". Setting this explicitly removes the guesswork and
+        # is the standard fix for exactly that warning.
+        torch.cuda.set_device(local_rank)
+        print(f"Explicitly pinned this process to GPU {local_rank} "
+              f"(avoids NCCL device-guessing, which can hang)")
+
         # Proper DDP: each process loads its own full model copy pinned to
         # its own GPU. Trainer auto-detects torchrun's env vars and handles
         # gradient sync across processes — no extra code needed for that part.

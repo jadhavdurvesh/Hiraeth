@@ -256,6 +256,25 @@ it's actually frozen (GPU utilization at 0% in `nvidia-smi`) or just quiet
 — with `--logging_steps 5` you'll get a log line every 5 steps, so brief
 silence between logs is normal, not a freeze.
 
+**Both GPUs show ~100% utilization but the step count never advances past
+0/N, under `torchrun` (real symptom seen: stuck at `0/20`, GPUs pinned at
+100%):**
+This is a different kind of "frozen" than the DataLoader hang above — it's
+NCCL stuck waiting on a distributed collective operation, not idle. Look
+earlier in the log for this warning:
+```
+Guessing device ID based on global rank. This can cause a hang if rank to
+GPU mapping is heterogeneous. You can specify device_id in
+init_process_group()
+```
+If you see it, that's the cause — `train.py` now explicitly calls
+`torch.cuda.set_device(local_rank)` before any distributed communication to
+prevent exactly this (fixed after a real Kaggle run hit it). Re-clone or
+`git pull` to get the fix, then re-run. 100% GPU utilization with zero step
+progress for more than a few minutes is the signal to suspect this — a
+merely-slow-but-working first step (CUDA warmup) should still complete
+within a minute or two on a 7B model.
+
 **Large list of pip dependency-conflict warnings (google-colab, cudf,
 numba, torchvision, etc.) during install:**
 These are almost always about *other* preinstalled Kaggle packages
