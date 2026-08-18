@@ -242,17 +242,35 @@ OOM at batch size 1:
    — but won't help if memory is genuinely, not just fragmentedly, full.
 
 **Every step takes multiple minutes (~400 sec/step or similar), even with
-2 GPUs "detected":**
-1. Confirm you launched with `torchrun --standalone --nproc_per_node=2`,
-   not plain `python train.py` — this is the single biggest cause of this
-   exact symptom (see Step 5's explanation of naive sharding vs. DDP).
-2. Confirm the "Using fp16" log line appeared — bf16 on T4/P100 is a
-   second common cause of the same symptom.
+2 GPUs "detected" and DDP working correctly (confirmed real case: minutes
+per step even after the DDP hang and OOM were both already fixed):**
+1. Check the log line right after GPU detection — it now prints something
+   like `Using fp16 (compute capability 7.5 — pre-Ampere (T4/P100 etc)...)`.
+   If it instead says **"Using bf16"** on a T4 or P100, that was confirmed
+   to be the actual cause of minutes-per-step training in real testing —
+   `torch.cuda.is_bf16_supported()` can report `True` on these GPUs even
+   though they lack the Ampere-generation tensor cores needed to run bf16
+   fast. `train.py` now explicitly requires compute capability >= 8.0
+   before using bf16, so this specific cause should no longer occur — if
+   you still see "Using bf16" on a T4/P100 after pulling the latest code,
+   that's unexpected, please report it.
+2. Confirm you launched with `torchrun --standalone --nproc_per_node=2`,
+   not plain `python train.py` — naive single-process layer-sharding
+   across GPUs is the other major cause of this exact symptom (see Step 5's
+   explanation of naive sharding vs. DDP).
 3. Confirm `torch.cuda.is_available()` is `True` and GPUs show up in
    `nvidia-smi` mid-training (run `!nvidia-smi` in a separate cell while
    training runs) — if GPU utilization is near 0%, training is likely
    running on CPU, which usually means the earlier `--no-deps` step was
    skipped and torch got upgraded to a CUDA-incompatible version.
+4. Realistic expectation once everything above checks out: a 7B model QLoRA
+   fine-tune on 2x T4 should run somewhere in the range of a few seconds
+   per optimizer step at `batch_size=1`/`max_seq_length=1024`/
+   `gradient_accumulation_steps=16` (16 micro-batches happen between each
+   visible progress-bar tick, so the bar itself updates slower than the
+   underlying per-micro-batch speed — don't judge purely by how often the
+   bar moves, check the printed `s/it` or `it/s` value once it's up and
+   running for a few steps).
 
 **"Padding-free training is enabled but the attention implementation is
 not a supported Flash Attention variant" / packing cross-contamination

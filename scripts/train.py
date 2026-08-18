@@ -49,6 +49,16 @@ gradient_accumulation_steps=8 still gives an effective batch size of 16
 smaller batch sizes — the batch dimension and sequence-length dimension
 both directly scale that logits tensor's size.
 
+Speed: bf16 requires compute capability >= 8.0 (Ampere+) for real hardware
+acceleration — T4 (7.5, Turing) and P100 (6.0, Pascal) do NOT qualify, even
+though torch.cuda.is_bf16_supported() can still report True on them (that
+check only confirms bf16 ops won't error, not that they're fast). Using
+bf16 on T4/P100 anyway was confirmed, from a real burn test, to produce
+MINUTES per training step instead of seconds — for an LLM (almost entirely
+matmuls), this is the difference tensor-core acceleration makes. This
+script now explicitly requires compute capability >= 8.0 for bf16,
+overriding is_bf16_supported() alone.
+
 Robustness against TRL API drift: different trl versions accept different
 SFTConfig keyword arguments (this caused real crashes: `max_seq_length` and
 `warmup_ratio` being rejected with "unexpected keyword argument" on some
@@ -275,10 +285,27 @@ def main():
     else:
         device_map = "auto"  # single GPU — harmless, no sharding needed
 
-    use_bf16 = n_gpus > 0 and torch.cuda.is_bf16_supported()
+    # IMPORTANT: torch.cuda.is_bf16_supported() only confirms bf16 ops won't
+    # ERROR on this GPU — it does NOT confirm they run at full speed. Real
+    # hardware-accelerated bf16 tensor cores require Ampere or newer
+    # (compute capability >= 8.0). T4 (Turing, 7.5) and P100 (Pascal, 6.0)
+    # both report is_bf16_supported()=True on some PyTorch/driver combos,
+    # but bf16 matmuls on them run WITHOUT tensor-core acceleration — for an
+    # LLM (almost entirely matmuls), this is dramatic, easily the difference
+    # between seconds and MINUTES per step. Confirmed from a real burn test:
+    # "Using bf16 (GPU supports bf16)" printed on a T4, followed by
+    # minutes-per-step training. Always require compute capability >= 8.0
+    # for bf16, regardless of what is_bf16_supported() alone says.
+    if n_gpus > 0:
+        major, minor = torch.cuda.get_device_capability(0)
+        has_ampere_or_newer = (major, minor) >= (8, 0)
+    else:
+        major, minor = (0, 0)
+        has_ampere_or_newer = False
+    use_bf16 = n_gpus > 0 and torch.cuda.is_bf16_supported() and has_ampere_or_newer
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float16
-    print(f"Using {'bf16' if use_bf16 else 'fp16'} "
-          f"({'GPU supports bf16' if use_bf16 else 'GPU does not support bf16 (T4/P100) — using fp16 instead'})")
+    print(f"Using {'bf16' if use_bf16 else 'fp16'} (compute capability {major}.{minor} — "
+          f"{'Ampere+, real bf16 tensor-core acceleration' if has_ampere_or_newer else 'pre-Ampere (T4/P100 etc), bf16 would run unaccelerated — using fp16 instead'})")
 
     attn_implementation, packing = resolve_attention_and_packing(args.packing, n_gpus)
 
