@@ -131,10 +131,9 @@ you're clear to run the full training job.
     --val_file /kaggle/working/data/val.jsonl \
     --output_dir /kaggle/working/hiraeth-qlora \
     --num_train_epochs 3 \
-    --per_device_train_batch_size 2 \
     --gradient_accumulation_steps 8 \
     --learning_rate 2e-4 \
-    --max_seq_length 2048
+    --max_seq_length 1024
 ```
 
 Note: under DDP, effective batch size = `per_device_train_batch_size ×
@@ -220,10 +219,27 @@ This is a symptom of the naive single-process sharding path (`device_map=
 "auto"`), which splits layers unevenly across GPUs — one GPU can end up
 holding more of the model's activations than the other. Switching to
 `torchrun` (proper DDP, each GPU holds a symmetric full copy) should
-resolve this. If OOM still happens under torchrun, lower
-`--per_device_train_batch_size` to 1 and raise
-`--gradient_accumulation_steps` proportionally to keep the same effective
-batch size, or lower `--max_seq_length`.
+resolve this.
+
+**`torch.OutOfMemoryError: CUDA out of memory` under torchrun, both GPUs
+similarly loaded, error trace goes through `ForCausalLMLoss` /
+`shift_logits = logits[..., :-1, :].contiguous()` (real trace seen: 13.61GiB
+used of 14.56GiB on a T4, needed 1.32GiB more):**
+This is a genuine memory limit, not a bug — the loss computation
+materializes logits across the entire vocabulary (~152k tokens for
+Qwen2.5) for every token in the batch, and that tensor alone can be several
+GB at `max_seq_length=2048` with `per_device_train_batch_size=2`. Default
+batch size is now 1 for exactly this reason (effective batch size stays at
+16 under 2-GPU DDP thanks to `gradient_accumulation_steps=8`). If you still
+OOM at batch size 1:
+1. Lower `--max_seq_length` (e.g. to 1024) — this directly shrinks the same
+   oversized logits tensor, often more effective than batch size alone if
+   your dataset's examples are mostly shorter than 2048 tokens anyway
+   (check `python build.py stats` in Hiraeth-Forge for your actual
+   token-length distribution).
+2. `train.py` now sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+   automatically, which helps with fragmentation-related OOMs specifically
+   — but won't help if memory is genuinely, not just fragmentedly, full.
 
 **Every step takes multiple minutes (~400 sec/step or similar), even with
 2 GPUs "detected":**

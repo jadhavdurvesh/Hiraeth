@@ -39,6 +39,16 @@ if rank to GPU mapping is heterogeneous". Symptom if this happens: both
 GPUs show ~100% utilization (NCCL busy-waits on a stuck collective) but the
 training step count never advances past 0. This fix removes that guesswork.
 
+Memory: default --per_device_train_batch_size is 1 (not 2). The loss
+computation materializes logits across the FULL vocabulary (~152k tokens
+for Qwen2.5) for every token in the batch — this tensor alone was the
+actual cause of a confirmed CUDA OOM on a 14.56GB T4 at batch size 2 with
+max_seq_length=2048. Under 2-GPU DDP, batch_size=1 with the default
+gradient_accumulation_steps=8 still gives an effective batch size of 16
+(1 x 8 x 2 GPUs). If you still OOM, lower --max_seq_length before trying
+smaller batch sizes — the batch dimension and sequence-length dimension
+both directly scale that logits tensor's size.
+
 Robustness against TRL API drift: different trl versions accept different
 SFTConfig keyword arguments (this caused real crashes: `max_seq_length` and
 `warmup_ratio` being rejected with "unexpected keyword argument" on some
@@ -68,7 +78,6 @@ Usage:
       --val_file ../data/val.jsonl \
       --output_dir /kaggle/working/hiraeth-qlora \
       --num_train_epochs 3 \
-      --per_device_train_batch_size 1 \
       --gradient_accumulation_steps 16 \
       --learning_rate 2e-4 \
       --max_seq_length 1024
@@ -83,6 +92,11 @@ Usage:
 import argparse
 import inspect
 import os
+
+# Must be set before torch/CUDA context is created. Reduces the chance of
+# OOM from allocator fragmentation (PyTorch's own error message suggests
+# this exact setting when memory is tight but not technically exhausted).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from datasets import load_dataset
@@ -102,8 +116,8 @@ def parse_args():
     ap.add_argument("--val_file", default="../data/val.jsonl")
     ap.add_argument("--output_dir", default="/kaggle/working/hiraeth-qlora")
     ap.add_argument("--num_train_epochs", type=float, default=3)
-    ap.add_argument("--per_device_train_batch_size", type=int, default=2)
-    ap.add_argument("--per_device_eval_batch_size", type=int, default=2)
+    ap.add_argument("--per_device_train_batch_size", type=int, default=1)
+    ap.add_argument("--per_device_eval_batch_size", type=int, default=1)
     ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
     ap.add_argument("--learning_rate", type=float, default=2e-4)
     ap.add_argument("--max_seq_length", type=int, default=2048)
@@ -354,6 +368,13 @@ def main():
         packing=packing,
         neftune_noise_alpha=args.neftune_alpha if args.neftune_alpha > 0 else None,
         dataloader_num_workers=0,
+        # LoRA training never has unused parameters in the forward pass (all
+        # trainable params are used every step) — explicitly disabling this
+        # skips an unnecessary extra autograd graph traversal per step and
+        # quiets the "find_unused_parameters=True... did not find any unused
+        # parameters" warning seen in testing. Harmless either way, this is
+        # a minor performance cleanup, not a correctness fix.
+        ddp_find_unused_parameters=False,
         logging_first_step=True,
     )
 

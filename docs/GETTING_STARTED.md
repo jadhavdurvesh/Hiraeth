@@ -141,10 +141,9 @@ settings:
     --val_file /kaggle/working/data/val.jsonl \
     --output_dir /kaggle/working/hiraeth-qlora \
     --num_train_epochs 3 \
-    --per_device_train_batch_size 2 \
     --gradient_accumulation_steps 8 \
     --learning_rate 2e-4 \
-    --max_seq_length 2048
+    --max_seq_length 1024
 ```
 
 This will take a while — could be a few hours depending on your dataset
