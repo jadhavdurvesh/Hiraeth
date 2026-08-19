@@ -73,6 +73,15 @@ Falls back to sdpa + packing disabled if flash-attn isn't installed or the
 GPU doesn't support it, avoiding the cross-sample-contamination risk TRL
 warns about when packing without FA2.
 
+Cross-session checkpointing: Kaggle wipes /kaggle/working every session, so
+a checkpoint saved there doesn't survive to the next one. Use
+--push_checkpoint_to_hub <hf-repo-id> to automatically push the latest
+checkpoint to the Hub during training (requires being logged in first), and
+--resume_from_checkpoint <hf-repo-id> (same repo, in a NEW session) to
+download and resume from it. Use --resume_from_checkpoint auto instead to
+resume from whatever's already in --output_dir within the SAME session
+(e.g. after a crash) without a Hub round-trip.
+
 Usage:
 
   # Quick smoke test first (works with or without torchrun) — confirms the
@@ -110,11 +119,13 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from datasets import load_dataset
+from huggingface_hub import snapshot_download
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
 )
+from transformers.trainer_utils import get_last_checkpoint
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig
 
@@ -158,6 +169,28 @@ def parse_args():
         "--max_steps", type=int, default=-1,
         help="Cap total training steps. Use a small number (e.g. 20) for a quick "
              "smoke test before committing to a full run. -1 = no cap.",
+    )
+
+    # --- Cross-session checkpointing (Kaggle wipes /kaggle/working every session) ---
+    ap.add_argument(
+        "--resume_from_checkpoint", default=None,
+        help="Resume training from a checkpoint. Accepts: 'auto' (use the latest "
+             "checkpoint already in --output_dir, for resuming within the SAME "
+             "session after a crash); a local directory path; or a Hugging Face "
+             "Hub repo id (e.g. 'yourname/hiraeth-checkpoints') to download and "
+             "resume from — this is the one that actually works ACROSS separate "
+             "Kaggle sessions, since the Hub persists but /kaggle/working doesn't.",
+    )
+    ap.add_argument(
+        "--push_checkpoint_to_hub", default=None,
+        help="Hugging Face Hub repo id to automatically push checkpoints to during "
+             "training (e.g. 'yourname/hiraeth-checkpoints'). Requires being logged "
+             "in first (huggingface-cli login, or login() in Python) — see the "
+             "notebook's HF Hub cells. Only the latest checkpoint is kept on the "
+             "Hub (hub_strategy='checkpoint') to save storage/bandwidth. This is "
+             "what makes --resume_from_checkpoint work across separate sessions: "
+             "push here at the end of one session, resume from the same repo id "
+             "at the start of the next.",
     )
     return ap.parse_args()
 
@@ -256,6 +289,10 @@ def main():
     print(f"Detected {n_gpus} GPU(s) visible" + (f", running distributed rank {local_rank}/{world_size}" if is_distributed else ""))
     for i in range(n_gpus):
         print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+
+    # Lets cuDNN benchmark and cache the fastest kernel for the shapes it
+    # actually sees. Small, safe speed win — no effect on correctness.
+    torch.backends.cudnn.benchmark = True
 
     if is_distributed:
         # Explicitly pin this process to its GPU BEFORE any distributed
@@ -403,6 +440,14 @@ def main():
         # a minor performance cleanup, not a correctness fix.
         ddp_find_unused_parameters=False,
         logging_first_step=True,
+        # Cross-session checkpointing: if a Hub repo id was given, push the
+        # latest checkpoint there automatically at each save_steps interval.
+        # hub_strategy="checkpoint" keeps only the LATEST checkpoint on the
+        # Hub (not every single one), which keeps storage/bandwidth sane.
+        push_to_hub=args.push_checkpoint_to_hub is not None,
+        hub_model_id=args.push_checkpoint_to_hub,
+        hub_strategy="checkpoint",
+        hub_private_repo=True,
     )
 
     effective_batch = args.per_device_train_batch_size * args.gradient_accumulation_steps * max(world_size, 1)
@@ -418,8 +463,30 @@ def main():
         processing_class=tokenizer,
     )
 
+    # Resolve --resume_from_checkpoint into an actual local path (or None).
+    resume_checkpoint = None
+    if args.resume_from_checkpoint == "auto":
+        if os.path.isdir(args.output_dir):
+            resume_checkpoint = get_last_checkpoint(args.output_dir)
+            if resume_checkpoint:
+                print(f"Auto-resuming from checkpoint already in --output_dir: {resume_checkpoint}")
+            else:
+                print("--resume_from_checkpoint=auto but no checkpoint found in --output_dir — starting fresh.")
+    elif args.resume_from_checkpoint:
+        if os.path.isdir(args.resume_from_checkpoint):
+            resume_checkpoint = args.resume_from_checkpoint
+            print(f"Resuming from local checkpoint: {resume_checkpoint}")
+        else:
+            # Not a local path — treat it as a Hugging Face Hub repo id and
+            # download it. This is what makes resume work ACROSS separate
+            # Kaggle sessions (the Hub persists, /kaggle/working doesn't).
+            print(f"'{args.resume_from_checkpoint}' isn't a local path — treating it as a "
+                  f"Hugging Face Hub repo id and downloading it...")
+            resume_checkpoint = snapshot_download(repo_id=args.resume_from_checkpoint)
+            print(f"Downloaded checkpoint to: {resume_checkpoint}")
+
     print("Starting training...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
 
     print(f"Saving LoRA adapter to {args.output_dir}")
     trainer.save_model(args.output_dir)

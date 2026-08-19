@@ -131,23 +131,70 @@ you're clear to run the full training job.
     --val_file /kaggle/working/data/val.jsonl \
     --output_dir /kaggle/working/hiraeth-qlora \
     --num_train_epochs 3 \
-    --gradient_accumulation_steps 8 \
+    --gradient_accumulation_steps 16 \
     --learning_rate 2e-4 \
     --max_seq_length 1024
 ```
 
 Note: under DDP, effective batch size = `per_device_train_batch_size ×
-gradient_accumulation_steps × num_gpus` — with the defaults above and 2
-GPUs, that's `2 × 8 × 2 = 32`, double what a single-process run would give
-you. `train.py` prints the resolved effective batch size at startup — check
-it matches what you expect.
+gradient_accumulation_steps × num_gpus`. Default `per_device_train_batch_size`
+is 1 (kept low deliberately — see the OOM entry in Troubleshooting), so with
+2 GPUs that's `1 × 16 × 2 = 32`. `train.py` prints the resolved effective
+batch size at startup — check it matches what you expect.
 
 Estimate total time before committing: take the per-step time from your
 smoke test (after warmup), multiply by total steps
 (`num_train_epochs × dataset_size / effective_batch_size`). Compare against
-Kaggle's session limit (~9-12 hours) and weekly GPU quota (~30 hours). If it
-doesn't fit in one session, you'll need checkpoint-resume — not yet in
-`train.py`, flag it if you hit this.
+Kaggle's session limit (~9-12 hours) and weekly GPU quota (~30 hours).
+
+### Cross-session checkpointing
+
+If it won't fit in one session — likely for a dataset in the tens of
+thousands of examples — use `--push_checkpoint_to_hub` and
+`--resume_from_checkpoint`, both wired up in the notebook already. The core
+problem: `/kaggle/working` (and any checkpoint saved there) is wiped the
+moment a session ends, so checkpoints need to live somewhere that persists
+— Hugging Face Hub.
+
+```python
+!torchrun --standalone --nproc_per_node=2 Hiraeth/scripts/train.py \
+    ... \
+    --push_checkpoint_to_hub yourname/hiraeth-checkpoints
+```
+This pushes the latest checkpoint to that (private, by default) Hub repo
+automatically at each `--save_steps` interval, overwriting the previous one
+each time (not accumulating every checkpoint — keeps storage sane). Requires
+being logged in first: `huggingface-cli login --token <your-token>`, or the
+Kaggle Secrets pattern the notebook uses.
+
+Starting a **new** Kaggle session and want to continue where you left off:
+```python
+!torchrun --standalone --nproc_per_node=2 Hiraeth/scripts/train.py \
+    ... \
+    --push_checkpoint_to_hub yourname/hiraeth-checkpoints \
+    --resume_from_checkpoint yourname/hiraeth-checkpoints
+```
+Same repo id in both places — `train.py` detects it isn't a local path,
+downloads the latest checkpoint from the Hub, and resumes from there.
+
+Continuing in the **same** session after a crash (not a full session
+restart) — this is faster since it skips the download:
+```python
+    --resume_from_checkpoint auto
+```
+
+### Squeezing out more speed
+
+- **Install Flash Attention 2** if you haven't — this re-enables `packing`
+  (concatenating short examples into full-length blocks instead of wasting
+  compute on padding), which `train.py` otherwise disables automatically for
+  safety. `!pip install -q flash-attn --no-build-isolation` (takes several
+  minutes to build; T4 only, not supported on P100).
+- **Try a larger batch size** now that `max_seq_length` is 1024 (down from
+  the original 2048 that caused the OOM) — there may be more headroom than
+  the conservative default assumes. `--per_device_train_batch_size 2` with
+  `--gradient_accumulation_steps 8` gives the same effective batch size (32)
+  with better GPU utilization per step, if it fits in memory.
 
 ## 8. Merge and download
 
