@@ -188,8 +188,10 @@ restart) — this is faster since it skips the download:
 - **Install Flash Attention 2** if you haven't — this re-enables `packing`
   (concatenating short examples into full-length blocks instead of wasting
   compute on padding), which `train.py` otherwise disables automatically for
-  safety. `!pip install -q flash-attn --no-build-isolation` (takes several
-  minutes to build; T4 only, not supported on P100).
+  safety. Building from source is slow (20-40+ min) — try a prebuilt wheel
+  matching your exact torch/CUDA/Python versions first (installs in
+  seconds instead). See `docs/NOTEBOOK_COMMANDS.md` Cell 3b for the exact
+  commands and a wheel-lookup tool. T4 only, not supported on P100.
 - **Try a larger batch size** now that `max_seq_length` is 1024 (down from
   the original 2048 that caused the OOM) — there may be more headroom than
   the conservative default assumes. `--per_device_train_batch_size 2` with

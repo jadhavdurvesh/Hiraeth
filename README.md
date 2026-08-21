@@ -27,6 +27,7 @@ Hiraeth/
 │   └── hiraeth_train.ipynb  # Kaggle notebook: clone -> prep -> smoke test -> train -> merge -> eval -> zip
 └── docs/
     ├── GETTING_STARTED.md   # simple, plain-language step-by-step walkthrough
+    ├── NOTEBOOK_COMMANDS.md # exact copy-paste command for every notebook cell, in order
     ├── TRAINING_GUIDE.md    # step-by-step Kaggle guide with troubleshooting
     └── PLANNING.md          # archived original design doc
 ```
@@ -79,6 +80,10 @@ plain-language walkthrough with no assumed background.
 [`docs/TRAINING_GUIDE.md`](docs/TRAINING_GUIDE.md)** — it covers real issues
 people have hit (multi-GPU crashes, bf16-on-T4 slowdowns, apparent
 freezes) and exactly what to check at each step.
+
+**Prefer copy-paste commands over reading the notebook itself? See
+[`docs/NOTEBOOK_COMMANDS.md`](docs/NOTEBOOK_COMMANDS.md)** — every cell,
+in order, ready to paste.
 
 Short version:
 
@@ -145,19 +150,52 @@ real testing. See `docs/TRAINING_GUIDE.md` for the full explanation.
   and code, small enough to QLoRA-tune on 2× 16GB GPUs.
 - **Method:** QLoRA (4-bit NF4 + LoRA adapters), not full fine-tuning — not
   realistic on Kaggle's GPUs or a 10k-100k example dataset.
-- **GPU strategy:** `device_map="auto"` shards the base model across both
-  GPUs within a single notebook process, avoiding `torchrun`/multi-process
-  setup that's awkward inside a Kaggle notebook cell.
+- **GPU strategy:** proper data-parallel (DDP) via `torchrun` — each GPU
+  holds a full model copy and processes its own batch independently. A
+  naive `device_map="auto"` single-process fallback exists for convenience
+  or single-GPU use, but real testing confirmed it's dramatically slower
+  for multi-GPU (serializes activations across the GPU boundary on every
+  layer) — see "Multi-GPU strategy" above.
 - This is supervised fine-tuning (SFT) only — no RLHF/DPO here.
 
 ## Known gaps / things to add if you hit them
 
-- No `--resume_from_checkpoint` support in `train.py` yet — if a training
-  run doesn't finish in one Kaggle session (sessions cap around 9-12 hours,
-  ~30 GPU-hrs/week), you'll want to add this.
 - Topic/category balance in training data depends entirely on what
   Hiraeth-Forge produces — check `python build.py stats` there before
   training if you care about balance across categories.
+- Flash Attention 2 isn't installed by default (only auto-detected and used
+  if present) — see `docs/NOTEBOOK_COMMANDS.md` Cell 3b if you want the
+  extra speed and safer packing it enables.
+
+## Philosophy
+
+A few principles this project has actually been built around, not just
+aspirational ones:
+
+- **Fix what's actually broken, not what seems broken.** Nearly every fix
+  in this repo's history came from a real error message or a real burn
+  test, not a guess. When something was slow, the fix waited until the
+  actual bottleneck was identified (bf16 on hardware that doesn't
+  accelerate it) rather than changing several things at once and hoping.
+- **Status should be honest, not aspirational.** The README and guides say
+  what's actually verified versus what's written-but-untested, and get
+  updated as that changes. A script that "should work" and a script that
+  "has been run and confirmed working" are described differently on
+  purpose.
+- **Fail loud, not silent.** Where there's ambiguity — an unsupported
+  config option, an unmatched dataset file, a GPU that can't safely use a
+  feature — the code says so explicitly rather than guessing quietly and
+  possibly guessing wrong.
+- **The dataset and the model are the valuable, protected parts.** The
+  pipeline code is open for anyone to use, fork, and learn from. Hiraeth
+  Atlas and the trained weights are licensed more carefully (see below) —
+  the effort that goes into good training data and a trained model is
+  worth more than the scaffolding around it.
+- **Optimize for the actual constraint, not the theoretical one.** This
+  project targets what's realistically available — Kaggle's free 2× T4
+  GPUs — rather than assuming access to better hardware. Every design
+  choice (QLoRA over full fine-tuning, DDP over naive sharding, batch size
+  tuned to avoid OOM on a 16GB card) reflects that real constraint.
 
 ## License
 
